@@ -1,0 +1,65 @@
+{
+  "name": "socializeai",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist-electron/main.js",
+  "description": "Local-first AI messaging assistant for draft, approval, and safe personal messaging workflows.",
+  "author": "Mark Santos",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/markksantos/SocializeAI.git"
+  },
+  "homepage": "https://github.com/markksantos/SocializeAI#readme",
+  "bugs": {
+    "url": "https://github.com/markksantos/SocializeAI/issues"
+  },
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && npm run electron:dev\"",
+    "electron:dev": "tsc -p tsconfig.electron.json && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron dist-electron/main.js",
+    "desktop": "npm run build && electron dist-electron/main.js",
+    "typecheck": "tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.electron.json --noEmit",
+    "build": "tsc -p tsconfig.app.json --noEmit && vite build && tsc -p tsconfig.electron.json",
+    "package:mac": "npm run build && electron-builder --mac dir",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "productName": "SocializeAI",
+  "build": {
+    "appId": "com.markksantos.socializeai",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.social-networking",
+      "target": [
+        "dir"
+      ],
+      "hardenedRuntime": false
+    },
+    "npmRebuild": false
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.1.1",
+    "lucide-react": "^0.554.0",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "39.8.10",
+    "electron-builder": "26.8.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.4",
+    "wait-on": "^9.0.3"
+  }
+}
