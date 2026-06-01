@@ -311,13 +311,13 @@ function App() {
     );
   }
 
-  async function prepareBotReplyForContact(contact: Contact, mode: "manual" | "poll" = "poll", regenerate = false) {
+  async function prepareBotReplyForContact(contact: Contact, mode: "manual" | "poll" = "poll", regenerate = false, forceReply = false) {
     if (botCheckInFlight.current || (pendingBotSend && !regenerate)) return;
     botCheckInFlight.current = true;
     if (mode === "manual") setBusy("bot-check");
     try {
       if (regenerate) setPendingBotSend(null);
-      const result: PreparedAutopilotReply = await window.socializeAI.prepareAutopilotReply({ contact, regenerate });
+      const result: PreparedAutopilotReply = await window.socializeAI.prepareAutopilotReply({ contact, regenerate, forceReply });
       const saved = await window.socializeAI.getState();
       setState(saved);
 
@@ -400,7 +400,7 @@ function App() {
 
   async function regeneratePendingBotSend() {
     if (!pendingBotSend) return;
-    await prepareBotReplyForContact(pendingBotSend.contact, "manual", true);
+    await prepareBotReplyForContact(pendingBotSend.contact, "manual", true, true);
   }
 
   async function refreshActiveThreadAndBot(showNotice = false) {
@@ -473,7 +473,7 @@ function App() {
       setState(refreshed);
       setSettingsDraft(refreshed.settings);
       await loadThreadForContact(botContact, false, true);
-      await prepareBotReplyForContact(botContact, "manual");
+      await prepareBotReplyForContact(botContact, "manual", false, true);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

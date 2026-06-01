@@ -184,6 +184,7 @@ export type PreparedAutopilotReply = {
 export type PrepareAutopilotReplyRequest = {
   contact: Contact;
   regenerate?: boolean;
+  forceReply?: boolean;
 };
 
 export type PreparedAutopilotSendRequest = {

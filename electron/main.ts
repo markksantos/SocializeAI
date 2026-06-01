@@ -1100,10 +1100,11 @@ function canAutoSendDraft(state: AppState, inbound: string, draft: { riskLevel: 
   );
 }
 
-async function prepareAutopilotReply(request: Contact | { contact: Contact; regenerate?: boolean }) {
+async function prepareAutopilotReply(request: Contact | { contact: Contact; regenerate?: boolean; forceReply?: boolean }) {
   const state = await readState();
   const contactRequest = "contact" in request ? request.contact : request;
   const regenerate = "contact" in request ? Boolean(request.regenerate) : false;
+  const forceReply = "contact" in request ? Boolean(request.forceReply) : false;
   const contact = findStoredContact(state, contactRequest) || contactRequest;
   const details: string[] = [];
   if (!contact.allowAutopilot) {
@@ -1123,7 +1124,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
       return { ok: false, status: "idle", message: "No inbound iMessage found.", contact, details };
     }
     const inboundHash = hashText(inbound);
-    if (contact.lastAutopilotInboundHash === inboundHash) {
+    if (!forceReply && contact.lastAutopilotInboundHash === inboundHash) {
       return { ok: false, status: "idle", message: "Latest inbound message already handled.", contact, inboundHash, inboundText: inbound, details };
     }
 
@@ -1160,7 +1161,11 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
     }
 
     state.audits = [
-      createAudit("draft_generated", `Bot ${regenerate ? "regenerated" : "queued"} reply for ${contact.displayName}`, `Waiting 10 seconds before send. Risk: ${draft.riskLevel}.`),
+      createAudit(
+        "draft_generated",
+        `Bot ${regenerate ? "regenerated" : forceReply ? "queued fresh" : "queued"} reply for ${contact.displayName}`,
+        `Waiting 10 seconds before send. Risk: ${draft.riskLevel}.`
+      ),
       ...state.audits
     ].slice(0, 500);
     await writeState(state);
@@ -1610,7 +1615,9 @@ ipcMain.handle("imessage:import-history", async (_event, request: { handle: stri
 
 ipcMain.handle("autopilot:run-once", async () => runAutopilotOnce("manual"));
 
-ipcMain.handle("autopilot:prepare-reply", async (_event, request: Contact | { contact: Contact; regenerate?: boolean }) => prepareAutopilotReply(request));
+ipcMain.handle("autopilot:prepare-reply", async (_event, request: Contact | { contact: Contact; regenerate?: boolean; forceReply?: boolean }) =>
+  prepareAutopilotReply(request)
+);
 
 ipcMain.handle("autopilot:send-prepared", async (_event, request: { contact: Contact; inboundHash: string; text: string }) => sendPreparedAutopilotReply(request));
 
