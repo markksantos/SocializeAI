@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { latestInboundLine } from "./transcript.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1018,20 +1019,6 @@ function hashText(value: string) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function latestInboundLine(messages: string, handle: string) {
-  const lines = messages
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const normalizedHandle = handle.trim().toLowerCase();
-  return [...lines].reverse().find((line) => {
-    const lower = line.toLowerCase();
-    if (lower.includes(" me:")) return false;
-    if (!normalizedHandle) return !lower.includes(" me:");
-    return lower.includes(`${normalizedHandle}:`) || !lower.includes(" me:");
-  });
-}
-
 function appendDisclosureToText(settings: AppSettings, rawText: string) {
   const text = rawText.trim();
   if (!text) throw new Error("Message is empty.");
@@ -1131,7 +1118,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
 
   try {
     const imported = await importIMessageHistory(contact.handle, 40, contact.chatId);
-    const inbound = latestInboundLine(imported.messages, contact.handle);
+    const inbound = latestInboundLine(imported.messages);
     if (!inbound) {
       return { ok: false, status: "idle", message: "No inbound iMessage found.", contact, details };
     }
@@ -1259,7 +1246,7 @@ async function runAutopilotOnce(source: "manual" | "timer") {
     scanned += 1;
     try {
       const imported = await importIMessageHistory(contact.handle, 30, contact.chatId);
-      const inbound = latestInboundLine(imported.messages, contact.handle);
+      const inbound = latestInboundLine(imported.messages);
       if (!inbound) {
         skipped += 1;
         details.push(`${contact.displayName}: no inbound iMessage found.`);

@@ -19,6 +19,7 @@ import {
   X
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { chatBubblesFromTranscript, latestInboundFromTranscript } from "./transcript";
 import type {
   AiProvider,
   AppSettings,
@@ -36,14 +37,6 @@ import type {
 import { defaultSettings, suggestedLocalModels, suggestedOpenAiModels } from "./shared";
 
 type View = "workbench" | "contacts" | "settings" | "audit";
-
-type ChatBubble = {
-  id: string;
-  at: string;
-  sender: string;
-  text: string;
-  fromMe: boolean;
-};
 
 type PendingBotSend = {
   contact: Contact;
@@ -82,49 +75,6 @@ function contactFromChat(chat: IMessageChat, existing?: Contact): Contact {
     lastAutopilotAt: existing?.lastAutopilotAt,
     lastAutopilotInboundHash: existing?.lastAutopilotInboundHash
   };
-}
-
-function latestInboundFromTranscript(transcript: string, handle?: string) {
-  const lines = transcript
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const normalizedHandle = handle?.toLowerCase().trim();
-  return (
-    [...lines].reverse().find((line) => {
-      const lower = line.toLowerCase();
-      if (lower.includes(" me:")) return false;
-      if (!normalizedHandle) return true;
-      return lower.includes(`${normalizedHandle}:`) || !lower.includes(" me:");
-    }) ?? ""
-  );
-}
-
-function chatBubblesFromTranscript(transcript: string): ChatBubble[] {
-  return transcript
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line, index) => {
-      const match = line.match(/^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+([^:]+):\s*(.*)$/);
-      if (!match) {
-        return {
-          id: `${index}-${line.slice(0, 24)}`,
-          at: "",
-          sender: "Message",
-          text: line,
-          fromMe: false
-        };
-      }
-      const sender = match[2].trim();
-      return {
-        id: `${index}-${match[1]}`,
-        at: match[1],
-        sender,
-        text: match[3].trim() || "[No text content]",
-        fromMe: sender.toLowerCase() === "me"
-      };
-    });
 }
 
 function contactMatches(candidate: Contact, target: Contact) {
@@ -672,7 +622,7 @@ function App() {
         limit: 80
       });
       if (result.ok) {
-        const latest = latestInboundFromTranscript(result.messages, contact.handle);
+        const latest = latestInboundFromTranscript(result.messages);
         setConversationContext(result.messages);
         setCurrentMessage(latest);
         if (showNotice) setNotice(result.message);
@@ -966,7 +916,6 @@ function Workbench(props: {
       : selected?.platform === "imessage"
         ? props.state.settings.iMessageDryRun
         : true;
-  const loadedCount = props.conversationContext.split("\n").filter(Boolean).length;
   const platformLabel = selected?.platform === "imessage" ? "iMessage" : selected?.platform === "whatsapp" ? "WhatsApp" : "manual";
   const botRunning = botIsRunningForContact(props.state, selected);
   const participantLine =
@@ -1006,6 +955,7 @@ function Workbench(props: {
             : "Record manual send";
   const botButtonLabel = props.busy === "bot" ? (botRunning ? "Stopping" : "Starting") : botRunning ? "Stop bot" : "Start bot";
   const chatBubbles = chatBubblesFromTranscript(props.conversationContext);
+  const loadedCount = chatBubbles.length;
   const activityItems = props.state.audits
     .filter((item) => {
       const haystack = `${item.summary} ${item.detail || ""}`.toLowerCase();
