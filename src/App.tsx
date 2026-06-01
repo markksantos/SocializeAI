@@ -28,11 +28,16 @@ import type {
   Contact,
   DraftResult,
   IMessageChat,
+  ImportHistoryResult,
   MacPermissionReport,
+  MessagingChannel,
+  PermissionMode,
   Platform,
   PreparedAutopilotReply,
   ProviderTestResult,
-  SendMessageResult
+  SendMessageResult,
+  WhatsAppBridgeStatus,
+  WhatsAppChat
 } from "./shared";
 import { defaultSettings, suggestedLocalModels, suggestedOpenAiModels } from "./shared";
 
@@ -40,12 +45,19 @@ type View = "workbench" | "contacts" | "settings" | "audit";
 
 type PendingBotSend = {
   contact: Contact;
+  preparedContactKey: string;
   inboundHash: string;
   text: string;
   textParts: string[];
   draft?: DraftResult;
   secondsLeft: number;
 };
+
+function isPendingBotSend(value: unknown): value is PendingBotSend {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<PendingBotSend>;
+  return Boolean(candidate.contact && candidate.preparedContactKey && candidate.inboundHash && candidate.text && Array.isArray(candidate.textParts));
+}
 
 type BotWait = {
   contact: Contact;
@@ -56,6 +68,7 @@ type BotWait = {
 
 type HeldBotReview = {
   contact: Contact;
+  preparedContactKey: string;
   inboundHash: string;
   text: string;
   textParts: string[];
@@ -70,6 +83,14 @@ type NeedsInputPrompt = {
   question: string;
 };
 
+type ThreadAccessIssue = {
+  platform: "imessage" | "whatsapp";
+  title: string;
+  message: string;
+  detail?: string;
+  needsFullDiskAccess?: boolean;
+};
+
 const blankContact = (): Contact => ({
   id: crypto.randomUUID(),
   displayName: "",
@@ -77,6 +98,7 @@ const blankContact = (): Contact => ({
   handle: "",
   relationship: "",
   notes: "",
+  userInstruction: "",
   allowAutopilot: false,
   optedOut: false
 });
@@ -93,6 +115,27 @@ function contactFromChat(chat: IMessageChat, existing?: Contact): Contact {
     chatGuid: chat.guid,
     relationship: existing?.relationship || "",
     notes: existing?.notes || "",
+    userInstruction: existing?.userInstruction || "",
+    allowAutopilot: existing?.allowAutopilot ?? false,
+    optedOut: existing?.optedOut ?? false,
+    lastImportedAt: existing?.lastImportedAt,
+    lastAutopilotAt: existing?.lastAutopilotAt,
+    lastAutopilotInboundHash: existing?.lastAutopilotInboundHash
+  };
+}
+
+function contactFromWhatsAppChat(chat: WhatsAppChat, existing?: Contact): Contact {
+  const resolvedDisplayName = chat.contactName || chat.displayName || chat.chatIdentifier || "WhatsApp chat";
+  const existingDisplayName = existing?.displayName && existing.displayName !== existing.handle ? existing.displayName : "";
+  return {
+    id: existing?.id ?? `whatsapp:${chat.jid}`,
+    displayName: existingDisplayName || resolvedDisplayName,
+    platform: "whatsapp",
+    handle: existing?.handle || chat.jid || chat.chatIdentifier,
+    chatId: chat.jid,
+    relationship: existing?.relationship || "",
+    notes: existing?.notes || "",
+    userInstruction: existing?.userInstruction || "",
     allowAutopilot: existing?.allowAutopilot ?? false,
     optedOut: existing?.optedOut ?? false,
     lastImportedAt: existing?.lastImportedAt,
@@ -102,6 +145,7 @@ function contactFromChat(chat: IMessageChat, existing?: Contact): Contact {
 }
 
 function contactMatches(candidate: Contact, target: Contact) {
+  if (candidate.platform !== target.platform) return false;
   return (
     (!!candidate.chatId && candidate.chatId === target.chatId) ||
     (!!candidate.chatGuid && candidate.chatGuid === target.chatGuid) ||
@@ -109,10 +153,20 @@ function contactMatches(candidate: Contact, target: Contact) {
   );
 }
 
+function contactWorkflowKey(contact?: Contact) {
+  if (!contact) return "";
+  const channelId =
+    contact.platform === "imessage"
+      ? contact.chatGuid || contact.chatId || contact.handle || contact.id
+      : contact.chatId || contact.handle || contact.id;
+  return `${contact.platform}:${channelId}`;
+}
+
 function botIsRunningForContact(state: AppState, contact?: Contact) {
-  if (!contact || contact.platform !== "imessage") return false;
+  if (!contact || (contact.platform !== "imessage" && contact.platform !== "whatsapp")) return false;
   const managed = state.contacts.find((item) => contactMatches(item, contact));
-  return Boolean(managed?.allowAutopilot && !managed.optedOut && !state.settings.iMessageDryRun && !state.settings.requireHumanApproval);
+  const dryRun = contact.platform === "whatsapp" ? state.settings.whatsappDryRun : state.settings.iMessageDryRun;
+  return Boolean(managed?.allowAutopilot && !managed.optedOut && !dryRun);
 }
 
 function appendDisclosureToText(settings: AppSettings, rawText: string) {
@@ -134,6 +188,47 @@ function splitMessageParts(text: string) {
     .slice(0, 4);
 }
 
+function threadAccessIssueFromImport(contact: Contact, result: ImportHistoryResult): ThreadAccessIssue {
+  if (contact.platform === "imessage" && result.needsFullDiskAccess) {
+    return {
+      platform: "imessage",
+      title: "Messages access is blocked",
+      message: "SocializeAI needs Full Disk Access before it can read this iMessage thread.",
+      detail: result.detail,
+      needsFullDiskAccess: true
+    };
+  }
+  return {
+    platform: contact.platform === "whatsapp" ? "whatsapp" : "imessage",
+    title: result.message || "Could not load this thread",
+    message: result.detail || "Try reloading this conversation.",
+    detail: result.code ? result.code.replaceAll("_", " ") : undefined
+  };
+}
+
+const permissionModeOptions: Array<{ value: PermissionMode; label: string; description: string }> = [
+  {
+    value: "extra_safe",
+    label: "Extra safe",
+    description: "Ask before every bot message."
+  },
+  {
+    value: "safe",
+    label: "Safe",
+    description: "Ask only when a reply looks sensitive or uncertain."
+  },
+  {
+    value: "auto_review",
+    label: "Auto review",
+    description: "Send most replies after review; ask only for ultra-sensitive or unknown facts."
+  },
+  {
+    value: "dangerously_skip",
+    label: "Dangerously skip",
+    description: "Skip permission prompts and make a best-effort guess when context is missing."
+  }
+];
+
 function audit(type: AuditEvent["type"], summary: string, detail?: string): AuditEvent {
   return {
     id: crypto.randomUUID(),
@@ -147,10 +242,14 @@ function audit(type: AuditEvent["type"], summary: string, detail?: string): Audi
 function App() {
   const [state, setState] = useState<AppState | null>(null);
   const [view, setView] = useState<View>("workbench");
+  const [channel, setChannel] = useState<MessagingChannel>("imessage");
   const [selectedContactId, setSelectedContactId] = useState<string>("");
   const [imessageChats, setIMessageChats] = useState<IMessageChat[]>([]);
+  const [whatsappChats, setWhatsAppChats] = useState<WhatsAppChat[]>([]);
   const [selectedChatId, setSelectedChatId] = useState("");
+  const [selectedWhatsAppChatId, setSelectedWhatsAppChatId] = useState("");
   const [chatSearch, setChatSearch] = useState("");
+  const [whatsappStatus, setWhatsAppStatus] = useState<WhatsAppBridgeStatus | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings>(defaultSettings);
   const [contactDraft, setContactDraft] = useState<Contact>(blankContact());
   const [currentMessage, setCurrentMessage] = useState("");
@@ -159,21 +258,95 @@ function App() {
   const [userInstruction, setUserInstruction] = useState("");
   const [draft, setDraft] = useState<DraftResult | null>(null);
   const [finalText, setFinalText] = useState("");
-  const [pendingBotSend, setPendingBotSend] = useState<PendingBotSend | null>(null);
-  const [botWait, setBotWait] = useState<BotWait | null>(null);
-  const [heldBotReview, setHeldBotReview] = useState<HeldBotReview | null>(null);
-  const [heldReviewText, setHeldReviewText] = useState("");
-  const [needsInputPrompt, setNeedsInputPrompt] = useState<NeedsInputPrompt | null>(null);
-  const [needsInputAnswer, setNeedsInputAnswer] = useState("");
+  const [threadAccessIssue, setThreadAccessIssue] = useState<ThreadAccessIssue | null>(null);
+  const [pendingBotSends, setPendingBotSends] = useState<Record<string, PendingBotSend>>({});
+  const [botWaits, setBotWaits] = useState<Record<string, BotWait>>({});
+  const [heldBotReviews, setHeldBotReviews] = useState<Record<string, HeldBotReview>>({});
+  const [heldReviewTexts, setHeldReviewTexts] = useState<Record<string, string>>({});
+  const [needsInputPrompts, setNeedsInputPrompts] = useState<Record<string, NeedsInputPrompt>>({});
+  const [needsInputAnswers, setNeedsInputAnswers] = useState<Record<string, string>>({});
   const [permissionReport, setPermissionReport] = useState<MacPermissionReport | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string>("");
   const [error, setError] = useState<string>("");
   const botCheckInFlight = useRef(false);
   const pendingSendInFlight = useRef(false);
+  const pendingBotSendsRef = useRef<Record<string, PendingBotSend>>({});
+  const botWaitsRef = useRef<Record<string, BotWait>>({});
+  const heldBotReviewsRef = useRef<Record<string, HeldBotReview>>({});
+  const needsInputPromptsRef = useRef<Record<string, NeedsInputPrompt>>({});
+  const workbenchSaveRef = useRef<{ saving: boolean; pending: AppState | null }>({ saving: false, pending: null });
 
   const openFullDiskAccessSettings = () => window.socializeAI.openFullDiskAccessSettings();
   const updateSettingsDraft = (patch: Partial<AppSettings>) => setSettingsDraft((current) => ({ ...current, ...patch }));
+  const updateHeldReviewText = (value: string) => {
+    if (!activeContactKey) return;
+    setHeldReviewTexts((current) => ({ ...current, [activeContactKey]: value }));
+  };
+  const updateNeedsInputAnswer = (value: string) => {
+    if (!activeContactKey) return;
+    setNeedsInputAnswers((current) => ({ ...current, [activeContactKey]: value }));
+  };
+
+  async function flushWorkbenchFieldSave() {
+    if (workbenchSaveRef.current.saving) return;
+    workbenchSaveRef.current.saving = true;
+    try {
+      while (workbenchSaveRef.current.pending) {
+        const nextState = workbenchSaveRef.current.pending;
+        workbenchSaveRef.current.pending = null;
+        await window.socializeAI.saveState(nextState);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? `Could not save chat notes. ${err.message}` : "Could not save chat notes.");
+    } finally {
+      workbenchSaveRef.current.saving = false;
+      if (workbenchSaveRef.current.pending) void flushWorkbenchFieldSave();
+    }
+  }
+
+  function queueWorkbenchFieldSave(nextState: AppState) {
+    workbenchSaveRef.current.pending = nextState;
+    void flushWorkbenchFieldSave();
+  }
+
+  function patchContactWorkbenchFields(target: Contact | undefined, patch: { notes?: string; userInstruction?: string }) {
+    if (!target) return;
+    setState((current) => {
+      if (!current) return current;
+      const existing = current.contacts.find((contact) => contactMatches(contact, target));
+      const nextContact: Contact = {
+        ...target,
+        ...existing,
+        id: existing?.id ?? target.id,
+        displayName: existing?.displayName || target.displayName,
+        handle: existing?.handle || target.handle,
+        chatId: target.chatId || existing?.chatId,
+        chatGuid: target.chatGuid || existing?.chatGuid,
+        relationship: existing?.relationship || target.relationship || "family/friend",
+        notes: patch.notes ?? existing?.notes ?? target.notes ?? "",
+        userInstruction: patch.userInstruction ?? existing?.userInstruction ?? target.userInstruction ?? "",
+        allowAutopilot: existing?.allowAutopilot ?? target.allowAutopilot,
+        optedOut: existing?.optedOut ?? target.optedOut
+      };
+      const contacts = existing
+        ? current.contacts.map((contact) => (contactMatches(contact, target) ? nextContact : contact))
+        : [nextContact, ...current.contacts];
+      const nextState = { ...current, contacts };
+      queueWorkbenchFieldSave(nextState);
+      return nextState;
+    });
+  }
+
+  function updateRelationshipMemory(value: string) {
+    setRelationshipMemory(value);
+    patchContactWorkbenchFields(activeContact, { notes: value });
+  }
+
+  function updateUserInstruction(value: string) {
+    setUserInstruction(value);
+    patchContactWorkbenchFields(activeContact, { userInstruction: value });
+  }
 
   useEffect(() => {
     window.socializeAI
@@ -182,10 +355,18 @@ function App() {
         setState(loaded);
         setSettingsDraft(loaded.settings);
         setSelectedContactId(loaded.contacts[0]?.id ?? "");
-        if (loaded.settings.hasCompletedOnboarding) void refreshIMessageChats(false);
+        if (loaded.settings.hasCompletedOnboarding) {
+          void refreshIMessageChats(false);
+          void refreshWhatsAppStatus(false, loaded.settings);
+          void refreshWhatsAppChats(false);
+        }
       })
       .catch((err) => setError(err instanceof Error ? err.message : String(err)));
   }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = settingsDraft.darkModeEnabled ? "dark" : "light";
+  }, [settingsDraft.darkModeEnabled]);
 
   const selectedContact = useMemo(
     () => state?.contacts.find((contact) => contact.id === selectedContactId) ?? state?.contacts[0],
@@ -197,60 +378,113 @@ function App() {
     [imessageChats, selectedChatId]
   );
 
+  const selectedWhatsAppChat = useMemo(
+    () => whatsappChats.find((chat) => chat.chatId === selectedWhatsAppChatId) ?? whatsappChats[0],
+    [whatsappChats, selectedWhatsAppChatId]
+  );
+
   const activeContact = useMemo(() => {
     if (!state) return undefined;
-    if (selectedChat) {
+    if (channel === "imessage" && selectedChat) {
       const managed = state.contacts.find((contact) => contact.chatId === selectedChat.chatId || contact.chatGuid === selectedChat.guid);
       return contactFromChat(selectedChat, managed);
     }
-    return selectedContact;
-  }, [selectedChat, selectedContact, state]);
+    if (channel === "whatsapp" && selectedWhatsAppChat) {
+      const managed = state.contacts.find((contact) => contact.platform === "whatsapp" && (contact.chatId === selectedWhatsAppChat.jid || contact.handle === selectedWhatsAppChat.jid));
+      return contactFromWhatsAppChat(selectedWhatsAppChat, managed);
+    }
+    return selectedContact?.platform === channel ? selectedContact : undefined;
+  }, [channel, selectedChat, selectedWhatsAppChat, selectedContact, state]);
+
+  const activeContactKey = useMemo(() => contactWorkflowKey(activeContact), [activeContact]);
+  const pendingBotSend = activeContactKey ? pendingBotSends[activeContactKey] ?? null : null;
+  const botWait = activeContactKey ? botWaits[activeContactKey] ?? null : null;
+  const heldBotReview = activeContactKey ? heldBotReviews[activeContactKey] ?? null : null;
+  const heldReviewText = activeContactKey ? heldReviewTexts[activeContactKey] ?? "" : "";
+  const needsInputPrompt = activeContactKey ? needsInputPrompts[activeContactKey] ?? null : null;
+  const needsInputAnswer = activeContactKey ? needsInputAnswers[activeContactKey] ?? "" : "";
+
+  useEffect(() => {
+    pendingBotSendsRef.current = pendingBotSends;
+  }, [pendingBotSends]);
+
+  useEffect(() => {
+    botWaitsRef.current = botWaits;
+  }, [botWaits]);
+
+  useEffect(() => {
+    heldBotReviewsRef.current = heldBotReviews;
+  }, [heldBotReviews]);
+
+  useEffect(() => {
+    needsInputPromptsRef.current = needsInputPrompts;
+  }, [needsInputPrompts]);
 
   useEffect(() => {
     if (!activeContact?.chatId) return;
+    setThreadAccessIssue(null);
     setRelationshipMemory(activeContact.notes || "");
+    setUserInstruction(activeContact.userInstruction || "");
     setDraft(null);
     setFinalText("");
-    setPendingBotSend(null);
-    setBotWait(null);
-    setHeldBotReview(null);
-    setHeldReviewText("");
-    setNeedsInputPrompt(null);
-    setNeedsInputAnswer("");
     void loadThreadForContact(activeContact, false);
-  }, [activeContact?.chatId]);
+  }, [activeContact?.platform, activeContact?.chatId]);
 
   useEffect(() => {
-    if (!pendingBotSend) return;
-    if (pendingBotSend.secondsLeft <= 0) {
-      void sendPendingBotNow();
+    if (activeContact) return;
+    setRelationshipMemory("");
+    setUserInstruction("");
+    setDraft(null);
+    setFinalText("");
+    setConversationContext("");
+    setCurrentMessage("");
+    setThreadAccessIssue(null);
+  }, [channel, activeContact?.id]);
+
+  useEffect(() => {
+    const entries = Object.entries(pendingBotSends);
+    if (entries.length === 0) return;
+    const due = entries.find(([, pending]) => pending.secondsLeft <= 0);
+    if (due) {
+      void sendPendingBotNow(due[1]);
       return;
     }
     const timer = window.setTimeout(() => {
-      setPendingBotSend((pending) => (pending ? { ...pending, secondsLeft: Math.max(0, pending.secondsLeft - 1) } : pending));
+      setPendingBotSends((current) =>
+        Object.fromEntries(Object.entries(current).map(([key, pending]) => [key, { ...pending, secondsLeft: Math.max(0, pending.secondsLeft - 1) }]))
+      );
     }, 1000);
     return () => window.clearTimeout(timer);
-  }, [pendingBotSend?.secondsLeft, pendingBotSend?.inboundHash]);
+  }, [pendingBotSends]);
 
   useEffect(() => {
-    if (!botWait) return;
-    if (botWait.secondsLeft <= 0) {
-      void prepareBotReplyForContact(botWait.contact, "poll", false, botWait.forceReply, true);
+    const entries = Object.entries(botWaits);
+    if (entries.length === 0) return;
+    const due = entries.find(([, waiting]) => waiting.secondsLeft <= 0);
+    if (due) {
+      setBotWaits((current) => {
+        const next = { ...current };
+        delete next[due[0]];
+        return next;
+      });
+      void prepareBotReplyForContact(due[1].contact, "poll", false, due[1].forceReply, true);
       return;
     }
     const timer = window.setTimeout(() => {
-      setBotWait((waiting) => (waiting ? { ...waiting, secondsLeft: Math.max(0, waiting.secondsLeft - 1) } : waiting));
+      setBotWaits((current) =>
+        Object.fromEntries(Object.entries(current).map(([key, waiting]) => [key, { ...waiting, secondsLeft: Math.max(0, waiting.secondsLeft - 1) }]))
+      );
     }, 1000);
     return () => window.clearTimeout(timer);
-  }, [botWait?.secondsLeft, botWait?.contact.id, botWait?.forceReply]);
+  }, [botWaits]);
 
   useEffect(() => {
-    if (!state || !activeContact?.chatId || !state.settings.hasCompletedOnboarding) return;
+    if (!state || !state.settings.hasCompletedOnboarding) return;
     const poll = window.setInterval(() => {
       void refreshActiveThreadAndBot(false);
     }, 5000);
     return () => window.clearInterval(poll);
-  }, [state, activeContact?.chatId, pendingBotSend?.inboundHash, botWait?.contact.id, heldBotReview?.inboundHash, needsInputPrompt?.inboundHash]);
+  }, [state, activeContact?.platform, activeContact?.chatId]);
 
   async function refreshIMessageChats(showNotice = true) {
     setBusy("chats");
@@ -265,6 +499,57 @@ function App() {
     } finally {
       setBusy(null);
     }
+  }
+
+  async function refreshWhatsAppStatus(showNotice = true, settings = settingsDraft) {
+    try {
+      const status = await window.socializeAI.getWhatsAppBridgeStatus(settings);
+      setWhatsAppStatus(status);
+      if (status.databasePath) {
+        setSettingsDraft((current) =>
+          current.whatsappMessagesDbPath ? current : { ...current, whatsappMessagesDbPath: status.databasePath || current.whatsappMessagesDbPath }
+        );
+      }
+      if (showNotice) {
+        if (status.ok) setNotice(status.message);
+        else setError(`${status.message}${status.detail ? ` ${status.detail}` : ""}`);
+      }
+      return status;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (showNotice) setError(message);
+      return null;
+    }
+  }
+
+  async function refreshWhatsAppChats(showNotice = true) {
+    setBusy("chats");
+    if (showNotice) setError("");
+    try {
+      const status = await refreshWhatsAppStatus(false);
+      if (status && !status.databasePath && status.setupAction !== "run_electron") {
+        setWhatsAppChats([]);
+        if (showNotice) setError(`${status.message}${status.detail ? ` ${status.detail}` : ""}`);
+        return;
+      }
+      const chats = await window.socializeAI.listWhatsAppChats();
+      setWhatsAppChats(chats);
+      setSelectedWhatsAppChatId((previous) => previous || chats[0]?.chatId || "");
+      if (showNotice) setNotice(`Loaded ${chats.length} WhatsApp chats from the local bridge.`);
+    } catch (err) {
+      if (showNotice) setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function refreshChatsForChannel(targetChannel = channel, showNotice = true) {
+    if (targetChannel === "whatsapp") {
+      await refreshWhatsAppStatus(false);
+      await refreshWhatsAppChats(showNotice);
+      return;
+    }
+    await refreshIMessageChats(showNotice);
   }
 
   async function persist(next: AppState, message?: string, syncSettingsDraft = true) {
@@ -292,7 +577,7 @@ function App() {
     setBusy("settings");
     setError("");
     try {
-      await persist(
+      const saved = await persist(
         {
           ...state,
           settings: settingsDraft,
@@ -303,6 +588,8 @@ function App() {
         },
         "Settings saved."
       );
+      void refreshWhatsAppStatus(false, saved.settings);
+      void refreshWhatsAppChats(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -344,7 +631,7 @@ function App() {
         { ...settingsDraft, whatsappDryRun: !enabled },
         enabled ? "Enabled live WhatsApp sending" : "Enabled WhatsApp dry run",
         activeContact.displayName || activeContact.handle,
-        enabled ? "Live WhatsApp sending is on for configured Business Cloud API sends." : "WhatsApp dry run is on. Sends will only be recorded."
+        enabled ? "Live WhatsApp sending is on for the configured personal bridge." : "WhatsApp dry run is on. Sends will only be recorded."
       );
     }
   }
@@ -359,16 +646,6 @@ function App() {
     );
   }
 
-  async function setHumanApprovalRequired(required: boolean) {
-    if (!state) return;
-    await saveOperationalSettings(
-      { ...settingsDraft, requireHumanApproval: required },
-      required ? "Require human approval enabled" : "Autopilot auto-send gate enabled",
-      "Workbench autopilot control",
-      required ? "Autopilot will hold drafts for review." : "Autopilot can auto-send only low-risk eligible drafts when live send is also on."
-    );
-  }
-
   async function prepareBotReplyForContact(
     contact: Contact,
     mode: "manual" | "poll" = "poll",
@@ -377,13 +654,27 @@ function App() {
     skipWait = false,
     instructionOverride?: string
   ) {
-    if (botCheckInFlight.current || (pendingBotSend && !regenerate)) return;
+    const workflowKey = contactWorkflowKey(contact);
+    if (botCheckInFlight.current || (pendingBotSendsRef.current[workflowKey] && !regenerate)) return;
     botCheckInFlight.current = true;
     if (mode === "manual") setBusy("bot-check");
     try {
-      if (regenerate) setPendingBotSend(null);
-      if (skipWait) setBotWait(null);
-      const replyInstruction = instructionOverride ?? userInstruction;
+      if (regenerate) {
+        setPendingBotSends((current) => {
+          const next = { ...current };
+          delete next[workflowKey];
+          return next;
+        });
+      }
+      if (skipWait) {
+        setBotWaits((current) => {
+          const next = { ...current };
+          delete next[workflowKey];
+          return next;
+        });
+      }
+      const contactInstruction = activeContact && contactMatches(contact, activeContact) ? userInstruction : contact.userInstruction || "";
+      const replyInstruction = instructionOverride ?? contactInstruction;
       const result: PreparedAutopilotReply = await window.socializeAI.prepareAutopilotReply({
         contact,
         regenerate,
@@ -395,68 +686,150 @@ function App() {
       setState(saved);
 
       if (result.ok && result.status === "ready" && result.contact && result.inboundHash && result.draftText) {
-        setBotWait(null);
-        setHeldBotReview(null);
-        setHeldReviewText("");
-        setNeedsInputPrompt(null);
-        setNeedsInputAnswer("");
-        setPendingBotSend({
-          contact: result.contact,
-          inboundHash: result.inboundHash,
-          text: result.draftText,
-          textParts: result.messageParts?.length ? result.messageParts : [result.draftText],
-          draft: result.draft,
-          secondsLeft: 10
+        const resultContact = result.contact;
+        const resultInboundHash = result.inboundHash;
+        const resultDraftText = result.draftText;
+        const resultKey = contactWorkflowKey(resultContact);
+        setBotWaits((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
         });
+        setHeldBotReviews((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
+        });
+        setHeldReviewTexts((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
+        });
+        setNeedsInputPrompts((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
+        });
+        setNeedsInputAnswers((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
+        });
+        setPendingBotSends((current) => ({
+          ...current,
+          [resultKey]: {
+            contact: resultContact,
+            preparedContactKey: result.preparedContactKey || resultKey,
+            inboundHash: resultInboundHash,
+            text: resultDraftText,
+            textParts: result.messageParts?.length ? result.messageParts : [resultDraftText],
+            draft: result.draft,
+            secondsLeft: 10
+          }
+        }));
         setNotice("");
         setError("");
         return;
       }
 
       if (result.status === "needs_input" && result.contact) {
+        const resultContact = result.contact;
         const question = result.details.filter(Boolean).join(" ") || "The bot needs one detail from you before replying.";
-        setBotWait(null);
-        setPendingBotSend(null);
-        setHeldBotReview(null);
-        setHeldReviewText("");
-        setNeedsInputPrompt({
-          contact: result.contact,
-          inboundHash: result.inboundHash,
-          inboundText: result.inboundText,
-          question
+        const resultKey = contactWorkflowKey(resultContact);
+        setBotWaits((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
         });
-        setNeedsInputAnswer("");
+        setPendingBotSends((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
+        });
+        setHeldBotReviews((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
+        });
+        setHeldReviewTexts((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
+        });
+        setNeedsInputPrompts((current) => ({
+          ...current,
+          [resultKey]: {
+            contact: resultContact,
+            inboundHash: result.inboundHash,
+            inboundText: result.inboundText,
+            question
+          }
+        }));
+        setNeedsInputAnswers((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
+        });
         setNotice("");
         setError("");
         return;
       }
 
       if (result.status === "waiting" && result.contact) {
-        setBotWait({
-          contact: result.contact,
-          secondsLeft: result.waitSeconds ?? 30,
-          forceReply,
-          inboundText: result.inboundText
-        });
+        const resultContact = result.contact;
+        const resultKey = contactWorkflowKey(resultContact);
+        setBotWaits((current) => ({
+          ...current,
+          [resultKey]: {
+            contact: resultContact,
+            secondsLeft: result.waitSeconds ?? 30,
+            forceReply,
+            inboundText: result.inboundText
+          }
+        }));
         if (mode === "manual") setNotice(result.message);
         return;
       }
 
       if (result.status === "held" && result.contact && result.inboundHash && result.draftText) {
-        const textParts = result.messageParts?.length ? result.messageParts : [result.draftText];
-        setBotWait(null);
-        setPendingBotSend(null);
-        setNeedsInputPrompt(null);
-        setNeedsInputAnswer("");
-        setHeldBotReview({
-          contact: result.contact,
-          inboundHash: result.inboundHash,
-          text: result.draftText,
-          textParts,
-          draft: result.draft,
-          reason: result.details.filter(Boolean).join(" ") || result.message
+        const resultContact = result.contact;
+        const resultInboundHash = result.inboundHash;
+        const resultDraftText = result.draftText;
+        const textParts = result.messageParts?.length ? result.messageParts : [resultDraftText];
+        const resultKey = contactWorkflowKey(resultContact);
+        setBotWaits((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
         });
-        setHeldReviewText(textParts.join("\n\n"));
+        setPendingBotSends((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
+        });
+        setNeedsInputPrompts((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
+        });
+        setNeedsInputAnswers((current) => {
+          const next = { ...current };
+          delete next[resultKey];
+          return next;
+        });
+        setHeldBotReviews((current) => ({
+          ...current,
+          [resultKey]: {
+            contact: resultContact,
+            preparedContactKey: result.preparedContactKey || resultKey,
+            inboundHash: resultInboundHash,
+            text: resultDraftText,
+            textParts,
+            draft: result.draft,
+            reason: result.details.filter(Boolean).join(" ") || result.message
+          }
+        }));
+        setHeldReviewTexts((current) => ({ ...current, [resultKey]: textParts.join("\n\n") }));
         setNotice("");
         setError("");
         return;
@@ -476,28 +849,37 @@ function App() {
     }
   }
 
-  async function sendPendingBotNow() {
-    if (!pendingBotSend || pendingSendInFlight.current) return;
+  async function sendPendingBotNow(explicitPending?: PendingBotSend) {
+    const pending = isPendingBotSend(explicitPending) ? explicitPending : pendingBotSend;
+    if (!pending || pendingSendInFlight.current) return;
+    const workflowKey = contactWorkflowKey(pending.contact);
+    const latestPending = pendingBotSendsRef.current[workflowKey];
+    if (!latestPending || latestPending.inboundHash !== pending.inboundHash || latestPending.preparedContactKey !== pending.preparedContactKey) return;
     pendingSendInFlight.current = true;
     setBusy("bot-send");
     setError("");
     try {
       await syncPendingSettings();
       const result = await window.socializeAI.sendPreparedAutopilotReply({
-        contact: pendingBotSend.contact,
-        inboundHash: pendingBotSend.inboundHash,
-        text: pendingBotSend.text,
-        textParts: pendingBotSend.textParts
+        contact: pending.contact,
+        preparedContactKey: pending.preparedContactKey,
+        inboundHash: pending.inboundHash,
+        text: pending.text,
+        textParts: pending.textParts
       });
-      const contactName = pendingBotSend.contact.displayName || "this chat";
-      setPendingBotSend(null);
+      const contactName = pending.contact.displayName || "this chat";
+      setPendingBotSends((current) => {
+        const next = { ...current };
+        delete next[workflowKey];
+        return next;
+      });
       if (result.ok) setNotice(result.dryRun ? `Dry run recorded for ${contactName}.` : `Bot sent a reply to ${contactName}.`);
       else setError(result.detail || result.message);
       const saved = await window.socializeAI.getState();
       setState(saved);
       setSettingsDraft(saved.settings);
-      await loadThreadForContact(pendingBotSend.contact, false, true);
-      void refreshIMessageChats(false);
+      await loadThreadForContact(pending.contact, false, true);
+      void refreshChatsForChannel(pending.contact.platform === "whatsapp" ? "whatsapp" : "imessage", false);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -508,6 +890,7 @@ function App() {
 
   async function cancelPendingBotSend() {
     if (!pendingBotSend) return;
+    const workflowKey = contactWorkflowKey(pendingBotSend.contact);
     setBusy("bot-cancel");
     try {
       const result = await window.socializeAI.cancelPreparedAutopilotReply({
@@ -515,7 +898,11 @@ function App() {
         inboundHash: pendingBotSend.inboundHash,
         reason: "User cancelled from the conversation window."
       });
-      setPendingBotSend(null);
+      setPendingBotSends((current) => {
+        const next = { ...current };
+        delete next[workflowKey];
+        return next;
+      });
       if (result.ok) setNotice("Pending bot reply cancelled.");
       else setError(result.message);
       const saved = await window.socializeAI.getState();
@@ -539,6 +926,7 @@ function App() {
 
   async function approveHeldBotReview() {
     if (!heldBotReview || pendingSendInFlight.current) return;
+    const workflowKey = contactWorkflowKey(heldBotReview.contact);
     const textParts = splitMessageParts(heldReviewText);
     if (textParts.length === 0) {
       setError("Write a reply before approving.");
@@ -551,20 +939,29 @@ function App() {
       await syncPendingSettings();
       const result = await window.socializeAI.sendPreparedAutopilotReply({
         contact: heldBotReview.contact,
+        preparedContactKey: heldBotReview.preparedContactKey,
         inboundHash: heldBotReview.inboundHash,
         text: textParts.join("\n\n"),
         textParts
       });
       const contactName = heldBotReview.contact.displayName || "this chat";
-      setHeldBotReview(null);
-      setHeldReviewText("");
+      setHeldBotReviews((current) => {
+        const next = { ...current };
+        delete next[workflowKey];
+        return next;
+      });
+      setHeldReviewTexts((current) => {
+        const next = { ...current };
+        delete next[workflowKey];
+        return next;
+      });
       if (result.ok) setNotice(result.dryRun ? `Dry run recorded for ${contactName}.` : `Approved and sent reply to ${contactName}.`);
       else setError(result.detail || result.message);
       const saved = await window.socializeAI.getState();
       setState(saved);
       setSettingsDraft(saved.settings);
       await loadThreadForContact(heldBotReview.contact, false, true);
-      void refreshIMessageChats(false);
+      void refreshChatsForChannel(heldBotReview.contact.platform === "whatsapp" ? "whatsapp" : "imessage", false);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -575,6 +972,7 @@ function App() {
 
   async function denyHeldBotReview() {
     if (!heldBotReview) return;
+    const workflowKey = contactWorkflowKey(heldBotReview.contact);
     setBusy("bot-cancel");
     setError("");
     try {
@@ -583,8 +981,16 @@ function App() {
         inboundHash: heldBotReview.inboundHash,
         reason: "User denied the held draft from the review popup."
       });
-      setHeldBotReview(null);
-      setHeldReviewText("");
+      setHeldBotReviews((current) => {
+        const next = { ...current };
+        delete next[workflowKey];
+        return next;
+      });
+      setHeldReviewTexts((current) => {
+        const next = { ...current };
+        delete next[workflowKey];
+        return next;
+      });
       if (result.ok) setNotice("Held bot reply denied.");
       else setError(result.message);
       const saved = await window.socializeAI.getState();
@@ -604,30 +1010,64 @@ function App() {
       return;
     }
     const contact = needsInputPrompt.contact;
+    const workflowKey = contactWorkflowKey(contact);
     setUserInstruction(answer);
-    setNeedsInputPrompt(null);
-    setNeedsInputAnswer("");
+    patchContactWorkbenchFields(contact, { userInstruction: answer });
+    setNeedsInputPrompts((current) => {
+      const next = { ...current };
+      delete next[workflowKey];
+      return next;
+    });
+    setNeedsInputAnswers((current) => {
+      const next = { ...current };
+      delete next[workflowKey];
+      return next;
+    });
     await prepareBotReplyForContact(contact, "manual", false, true, true, answer);
   }
 
   function dismissNeedsInputPrompt() {
-    setNeedsInputPrompt(null);
-    setNeedsInputAnswer("");
+    if (needsInputPrompt) {
+      const workflowKey = contactWorkflowKey(needsInputPrompt.contact);
+      setNeedsInputPrompts((current) => {
+        const next = { ...current };
+        delete next[workflowKey];
+        return next;
+      });
+      setNeedsInputAnswers((current) => {
+        const next = { ...current };
+        delete next[workflowKey];
+        return next;
+      });
+    }
     setNotice("Bot paused this reply until you provide the missing answer.");
   }
 
   async function refreshActiveThreadAndBot(showNotice = false) {
-    if (!state || !activeContact?.chatId) return;
-    await loadThreadForContact(activeContact, showNotice, !showNotice);
-    if (botIsRunningForContact(state, activeContact) && !pendingBotSend && !botWait && !heldBotReview && !needsInputPrompt) {
-      await prepareBotReplyForContact(activeContact, "poll");
+    if (!state) return;
+    if (activeContact?.chatId) {
+      await loadThreadForContact(activeContact, showNotice, !showNotice);
+    }
+
+    const runningContacts = state.contacts.filter((contact) => botIsRunningForContact(state, contact));
+    for (const runningContact of runningContacts) {
+      const workflowKey = contactWorkflowKey(runningContact);
+      if (
+        pendingBotSendsRef.current[workflowKey] ||
+        botWaitsRef.current[workflowKey] ||
+        heldBotReviewsRef.current[workflowKey] ||
+        needsInputPromptsRef.current[workflowKey]
+      ) {
+        continue;
+      }
+      await prepareBotReplyForContact(runningContact, "poll");
     }
   }
 
   async function startBotForSelectedChat() {
     if (!state || !activeContact) return;
-    if (activeContact.platform !== "imessage" || !activeContact.chatId) {
-      setError("Choose an iMessage chat first.");
+    if ((activeContact.platform !== "imessage" && activeContact.platform !== "whatsapp") || !activeContact.chatId) {
+      setError("Choose an iMessage or WhatsApp chat first.");
       return;
     }
     if (activeContact.optedOut) {
@@ -639,34 +1079,43 @@ function App() {
     setError("");
     setNotice("");
     try {
+      if (activeContact.platform === "whatsapp") {
+        const status = await window.socializeAI.getWhatsAppBridgeStatus(settingsDraft);
+        setWhatsAppStatus(status);
+        if (!status.ok) {
+          setError(`${status.message}${status.detail ? ` ${status.detail}` : ""}`);
+          return;
+        }
+      }
       const existing = state.contacts.find(
-        (contact) => contact.chatId === activeContact.chatId || contact.chatGuid === activeContact.chatGuid || contact.id === activeContact.id
+        (contact) =>
+          contact.platform === activeContact.platform &&
+          (contact.chatId === activeContact.chatId || contact.chatGuid === activeContact.chatGuid || contact.id === activeContact.id)
       );
       const botContact: Contact = {
         ...activeContact,
         ...existing,
-        displayName: activeContact.displayName || existing?.displayName || "iMessage chat",
+        displayName: activeContact.displayName || existing?.displayName || (activeContact.platform === "whatsapp" ? "WhatsApp chat" : "iMessage chat"),
         handle: activeContact.handle || existing?.handle || "",
         chatId: activeContact.chatId,
         chatGuid: activeContact.chatGuid || existing?.chatGuid,
         relationship: existing?.relationship || activeContact.relationship || "family/friend",
-        notes: existing?.notes || activeContact.notes || "",
+        notes: relationshipMemory,
+        userInstruction,
         allowAutopilot: true,
         optedOut: existing?.optedOut ?? activeContact.optedOut
       };
       const matchesSelected = (contact: Contact) =>
-        contact.chatId === botContact.chatId || contact.chatGuid === botContact.chatGuid || contact.id === botContact.id;
-      const contacts = [
-        botContact,
-        ...state.contacts.filter((contact) => !matchesSelected(contact)).map((contact) => ({ ...contact, allowAutopilot: false }))
-      ];
+        contact.platform === botContact.platform && (contact.chatId === botContact.chatId || contact.chatGuid === botContact.chatGuid || contact.id === botContact.id);
+      const contacts = [botContact, ...state.contacts.filter((contact) => !matchesSelected(contact))];
       await persist(
         {
           ...state,
           settings: {
             ...settingsDraft,
-            iMessageDryRun: false,
-            requireHumanApproval: false,
+            iMessageDryRun: activeContact.platform === "imessage" ? false : settingsDraft.iMessageDryRun,
+            whatsappDryRun: activeContact.platform === "whatsapp" ? false : settingsDraft.whatsappDryRun,
+            requireHumanApproval: settingsDraft.permissionMode === "extra_safe",
             autopilotEnabled: false
           },
           contacts,
@@ -674,7 +1123,7 @@ function App() {
             audit(
               "settings_saved",
               `Started bot for ${botContact.displayName}`,
-              "Live iMessage autopilot enabled for the selected chat only."
+              `Live ${activeContact.platform === "whatsapp" ? "WhatsApp" : "iMessage"} autopilot enabled for this chat. Other running chats were left unchanged.`
             ),
             ...state.audits
           ].slice(0, 500)
@@ -701,13 +1150,19 @@ function App() {
     setNotice("");
     try {
       const contacts = state.contacts.map((contact) =>
-        contact.chatId === activeContact.chatId || contact.chatGuid === activeContact.chatGuid || contact.id === activeContact.id
+        contact.platform === activeContact.platform &&
+        (contact.chatId === activeContact.chatId || contact.chatGuid === activeContact.chatGuid || contact.id === activeContact.id)
           ? { ...contact, allowAutopilot: false }
           : contact
       );
       const anyChatStillRunning = contacts.some((contact) => contact.allowAutopilot);
       if (pendingBotSend && contactMatches(pendingBotSend.contact, activeContact)) {
-        setPendingBotSend(null);
+        const workflowKey = contactWorkflowKey(pendingBotSend.contact);
+        setPendingBotSends((current) => {
+          const next = { ...current };
+          delete next[workflowKey];
+          return next;
+        });
       }
       await persist(
         {
@@ -741,6 +1196,8 @@ function App() {
       setSelectedContactId(saved.contacts[0]?.id ?? "");
       setNotice("Onboarding complete.");
       void refreshIMessageChats(false);
+      void refreshWhatsAppStatus(false, saved.settings);
+      void refreshWhatsAppChats(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -764,7 +1221,7 @@ function App() {
 
   async function generateDraft() {
     if (!activeContact) {
-      setError("Choose an iMessage chat first.");
+      setError("Choose an iMessage or WhatsApp chat first.");
       return;
     }
     setBusy("draft");
@@ -774,7 +1231,7 @@ function App() {
       await syncPendingSettings();
       let context = conversationContext;
       let latest = currentMessage;
-      if (activeContact.platform === "imessage" && activeContact.chatId) {
+      if ((activeContact.platform === "imessage" || activeContact.platform === "whatsapp") && activeContact.chatId) {
         const loaded = await loadThreadForContact(activeContact, false);
         context = loaded.context;
         latest = loaded.latest;
@@ -827,9 +1284,11 @@ function App() {
     if (!silent) {
       setBusy("import");
       setError("");
+      setThreadAccessIssue(null);
     }
     try {
-      const result = await window.socializeAI.importIMessageHistory({
+      const importMethod = contact.platform === "whatsapp" ? window.socializeAI.importWhatsAppHistory : window.socializeAI.importIMessageHistory;
+      const result: ImportHistoryResult = await importMethod({
         handle: contact.handle,
         chatId: contact.chatId,
         limit: 80
@@ -838,13 +1297,23 @@ function App() {
         const latest = latestInboundFromTranscript(result.messages);
         setConversationContext(result.messages);
         setCurrentMessage(latest);
+        setThreadAccessIssue(null);
         if (showNotice) setNotice(result.message);
         return { context: result.messages, latest };
       } else {
-        if (!silent) setError(`${result.message}${result.detail ? ` ${result.detail}` : ""}`);
+        const issue = threadAccessIssueFromImport(contact, result);
+        setThreadAccessIssue(issue);
+        if (!silent) setError(issue.title);
       }
     } catch (err) {
-      if (!silent) setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      const issue: ThreadAccessIssue = {
+        platform: contact.platform === "whatsapp" ? "whatsapp" : "imessage",
+        title: "Could not load this thread",
+        message
+      };
+      setThreadAccessIssue(issue);
+      if (!silent) setError(issue.title);
     } finally {
       if (!silent) setBusy(null);
     }
@@ -853,14 +1322,19 @@ function App() {
 
   async function saveContact(contact: Contact) {
     if (!state) return;
-    const isExisting = state.contacts.some((item) => item.id === contact.id);
-    const contacts = isExisting ? state.contacts.map((item) => (item.id === contact.id ? contact : item)) : [contact, ...state.contacts];
+    const existing = state.contacts.find((item) => item.id === contact.id);
+    const contactToSave = {
+      ...existing,
+      ...contact,
+      userInstruction: contact.userInstruction ?? existing?.userInstruction ?? ""
+    };
+    const contacts = existing ? state.contacts.map((item) => (item.id === contact.id ? contactToSave : item)) : [contactToSave, ...state.contacts];
     await persist(
       {
         ...state,
         contacts,
         audits: [
-          audit("contact_saved", `Saved ${contact.displayName || "contact"}`, `${contact.platform}: ${contact.handle}`),
+          audit("contact_saved", `Saved ${contactToSave.displayName || "contact"}`, `${contactToSave.platform}: ${contactToSave.handle}`),
           ...state.audits
         ].slice(0, 500)
       },
@@ -868,13 +1342,15 @@ function App() {
       false
     );
     setContactDraft(blankContact());
-    setSelectedContactId(contact.id);
+    setSelectedContactId(contactToSave.id);
   }
 
   async function manageSelectedChatForAutopilot() {
-    if (!selectedChat || !state) return;
-    const existing = state.contacts.find((contact) => contact.chatId === selectedChat.chatId || contact.chatGuid === selectedChat.guid);
-    const contact = contactFromChat(selectedChat, existing);
+    if (!state) return;
+    const sourceChat = channel === "whatsapp" ? selectedWhatsAppChat : selectedChat;
+    if (!sourceChat) return;
+    const existing = state.contacts.find((contact) => contact.platform === channel && contact.chatId === sourceChat.chatId);
+    const contact = channel === "whatsapp" ? contactFromWhatsAppChat(sourceChat as WhatsAppChat, existing) : contactFromChat(sourceChat as IMessageChat, existing);
     await saveContact({ ...contact, allowAutopilot: true, relationship: contact.relationship || "family/friend" });
     setNotice(`${contact.displayName} is saved for autopilot. Keep dry run on until you trust the drafts.`);
   }
@@ -904,6 +1380,49 @@ function App() {
       setPermissionReport(report);
       const okCount = Object.values(report).filter((item) => item.ok).length;
       setNotice(`Mac permissions checked: ${okCount}/3 ready.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function checkWhatsAppBridge() {
+    setBusy("whatsapp");
+    setError("");
+    try {
+      const status = await window.socializeAI.getWhatsAppBridgeStatus(settingsDraft);
+      setWhatsAppStatus(status);
+      if (status.databasePath) {
+        setSettingsDraft((current) =>
+          current.whatsappMessagesDbPath ? current : { ...current, whatsappMessagesDbPath: status.databasePath || current.whatsappMessagesDbPath }
+        );
+      }
+      if (status.ok) setNotice(status.message);
+      else setError(`${status.message}${status.detail ? ` ${status.detail}` : ""}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function startWhatsAppBridge() {
+    setBusy("whatsapp-start");
+    setError("");
+    try {
+      const status = await window.socializeAI.startWhatsAppBridge(settingsDraft);
+      setWhatsAppStatus(status);
+      if (status.databasePath) {
+        setSettingsDraft((current) =>
+          current.whatsappMessagesDbPath ? current : { ...current, whatsappMessagesDbPath: status.databasePath || current.whatsappMessagesDbPath }
+        );
+      }
+      if (status.setupAction === "runtime_install_failed" || status.setupAction === "install_git") {
+        setError(`${status.message}${status.detail ? ` ${status.detail}` : ""}`);
+      } else {
+        setNotice(`${status.message}${status.detail ? ` ${status.detail}` : ""}`);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -959,6 +1478,16 @@ function App() {
 
         <nav className="nav-list">
           <NavButton active={view === "workbench"} icon={<Wand2 size={18} />} label="Workbench" onClick={() => setView("workbench")} />
+          {view === "workbench" && (
+            <div className="nav-submenu" aria-label="Workbench channel">
+              <button className={channel === "imessage" ? "active" : ""} onClick={() => setChannel("imessage")} type="button">
+                iMessage
+              </button>
+              <button className={channel === "whatsapp" ? "active" : ""} onClick={() => setChannel("whatsapp")} type="button">
+                WhatsApp
+              </button>
+            </div>
+          )}
           <NavButton active={view === "settings"} icon={<SlidersHorizontal size={18} />} label="Settings" onClick={() => setView("settings")} />
           <NavButton active={view === "audit"} icon={<ClipboardList size={18} />} label="Audit" onClick={() => setView("audit")} />
         </nav>
@@ -975,41 +1504,49 @@ function App() {
         {view === "workbench" && (
           <Workbench
             state={state}
+            channel={channel}
             selectedContact={activeContact}
             imessageChats={imessageChats}
+            whatsappChats={whatsappChats}
             selectedChatId={selectedChatId}
             setSelectedChatId={setSelectedChatId}
+            selectedWhatsAppChatId={selectedWhatsAppChatId}
+            setSelectedWhatsAppChatId={setSelectedWhatsAppChatId}
             chatSearch={chatSearch}
             setChatSearch={setChatSearch}
+            whatsappStatus={whatsappStatus}
             currentMessage={currentMessage}
             setCurrentMessage={setCurrentMessage}
             conversationContext={conversationContext}
             setConversationContext={setConversationContext}
             relationshipMemory={relationshipMemory}
-            setRelationshipMemory={setRelationshipMemory}
+            setRelationshipMemory={updateRelationshipMemory}
             userInstruction={userInstruction}
-            setUserInstruction={setUserInstruction}
+            setUserInstruction={updateUserInstruction}
             draft={draft}
             finalText={finalText}
             setFinalText={setFinalText}
+            threadAccessIssue={threadAccessIssue}
             pendingBotSend={pendingBotSend}
             botWait={botWait}
             heldBotReview={heldBotReview}
             heldReviewText={heldReviewText}
-            setHeldReviewText={setHeldReviewText}
+            setHeldReviewText={updateHeldReviewText}
             needsInputPrompt={needsInputPrompt}
             needsInputAnswer={needsInputAnswer}
-            setNeedsInputAnswer={setNeedsInputAnswer}
+            setNeedsInputAnswer={updateNeedsInputAnswer}
             busy={busy}
             onSend={sendMessage}
             onImport={importHistory}
-            onRefreshChats={() => refreshIMessageChats()}
+            onRefreshChats={() => refreshChatsForChannel(channel)}
+            onStartWhatsAppBridge={startWhatsAppBridge}
             onRefreshThread={() => refreshActiveThreadAndBot(true)}
+            onOpenPermissions={openFullDiskAccessSettings}
+            onCheckPermissions={checkMacPermissions}
             onManageChat={manageSelectedChatForAutopilot}
             onRunAutopilot={runAutopilotOnce}
             onSetLiveSend={setLiveSendForSelected}
             onSetAutopilotSchedule={setAutopilotSchedule}
-            onSetHumanApprovalRequired={setHumanApprovalRequired}
             onStartBot={startBotForSelectedChat}
             onStopBot={stopBotForSelectedChat}
             onSendPendingNow={sendPendingBotNow}
@@ -1037,10 +1574,13 @@ function App() {
             settings={settingsDraft}
             updateSettings={updateSettingsDraft}
             permissionReport={permissionReport}
+            whatsappStatus={whatsappStatus}
             busy={busy}
             onSave={saveSettings}
             onTest={() => testProvider(settingsDraft)}
             onCheckPermissions={checkMacPermissions}
+            onCheckWhatsApp={checkWhatsAppBridge}
+            onStartWhatsApp={startWhatsAppBridge}
             onOpenPermissions={openFullDiskAccessSettings}
             onReveal={() => window.socializeAI.revealDataFolder()}
           />
@@ -1098,12 +1638,17 @@ function Onboarding(props: {
 
 function Workbench(props: {
   state: AppState;
+  channel: MessagingChannel;
   selectedContact?: Contact;
   imessageChats: IMessageChat[];
+  whatsappChats: WhatsAppChat[];
   selectedChatId: string;
   setSelectedChatId: (id: string) => void;
+  selectedWhatsAppChatId: string;
+  setSelectedWhatsAppChatId: (id: string) => void;
   chatSearch: string;
   setChatSearch: (value: string) => void;
+  whatsappStatus: WhatsAppBridgeStatus | null;
   currentMessage: string;
   setCurrentMessage: (value: string) => void;
   conversationContext: string;
@@ -1115,6 +1660,7 @@ function Workbench(props: {
   draft: DraftResult | null;
   finalText: string;
   setFinalText: (value: string) => void;
+  threadAccessIssue: ThreadAccessIssue | null;
   pendingBotSend: PendingBotSend | null;
   botWait: BotWait | null;
   heldBotReview: HeldBotReview | null;
@@ -1127,12 +1673,14 @@ function Workbench(props: {
   onSend: () => void;
   onImport: () => void;
   onRefreshChats: () => void;
+  onStartWhatsAppBridge: () => void;
   onRefreshThread: () => void;
+  onOpenPermissions: () => void;
+  onCheckPermissions: () => void;
   onManageChat: () => void;
   onRunAutopilot: () => void;
   onSetLiveSend: (enabled: boolean) => void;
   onSetAutopilotSchedule: (enabled: boolean) => void;
-  onSetHumanApprovalRequired: (required: boolean) => void;
   onStartBot: () => void;
   onStopBot: () => void;
   onSendPendingNow: () => void;
@@ -1145,15 +1693,18 @@ function Workbench(props: {
   onDismissNeedsInput: () => void;
 }) {
   const selected = props.selectedContact;
-  const selectedChat = props.imessageChats.find((chat) => chat.chatId === props.selectedChatId) ?? props.imessageChats[0];
-  const managed = selected ? props.state.contacts.find((contact) => contact.chatId === selected.chatId || contact.id === selected.id) : undefined;
+  const chats = props.channel === "whatsapp" ? props.whatsappChats : props.imessageChats;
+  const selectedChatId = props.channel === "whatsapp" ? props.selectedWhatsAppChatId : props.selectedChatId;
+  const setSelectedChatId = props.channel === "whatsapp" ? props.setSelectedWhatsAppChatId : props.setSelectedChatId;
+  const selectedChat = chats.find((chat) => chat.chatId === selectedChatId) ?? chats[0];
+  const managed = selected ? props.state.contacts.find((contact) => contactMatches(contact, selected)) : undefined;
   const dryRun =
     selected?.platform === "whatsapp"
       ? props.state.settings.whatsappDryRun
       : selected?.platform === "imessage"
         ? props.state.settings.iMessageDryRun
         : true;
-  const platformLabel = selected?.platform === "imessage" ? "iMessage" : selected?.platform === "whatsapp" ? "WhatsApp" : "manual";
+  const platformLabel = props.channel === "whatsapp" ? "WhatsApp" : "iMessage";
   const botRunning = botIsRunningForContact(props.state, selected);
   const participantLine =
     selectedChat?.participantNames?.slice(0, 4).join(", ") ||
@@ -1163,7 +1714,7 @@ function Workbench(props: {
     "";
   const query = props.chatSearch.trim().toLowerCase();
   const visibleChats = query
-    ? props.imessageChats.filter((chat) => {
+    ? chats.filter((chat) => {
         const haystack = [
           chat.displayName,
           chat.contactName,
@@ -1179,7 +1730,7 @@ function Workbench(props: {
           .toLowerCase();
         return haystack.includes(query);
       })
-    : props.imessageChats;
+    : chats;
   const sendButtonLabel =
     props.busy === "send"
       ? "Processing"
@@ -1206,8 +1757,8 @@ function Workbench(props: {
     <div className="workspace-grid">
       <section className="contact-rail">
         <div className="section-heading">
-          <span>iMessage chats</span>
-          <strong>{query ? `${visibleChats.length}/${props.imessageChats.length}` : props.imessageChats.length}</strong>
+          <span>{platformLabel} chats</span>
+          <strong>{query ? `${visibleChats.length}/${chats.length}` : chats.length}</strong>
         </div>
         <label className="search-field">
           <span>Search chats</span>
@@ -1220,16 +1771,30 @@ function Workbench(props: {
         </label>
         <button className="secondary-button full-width" onClick={props.onRefreshChats} disabled={props.busy === "chats"}>
           <MessagesSquare size={16} />
-          {props.busy === "chats" ? "Loading" : "Refresh chats"}
+          {props.busy === "chats" ? "Loading" : `Refresh ${platformLabel}`}
         </button>
+        {props.channel === "whatsapp" && props.whatsappStatus && !props.whatsappStatus.ok && (
+          <div className="channel-status warn">
+            <strong>{props.whatsappStatus.message}</strong>
+            {props.whatsappStatus.detail && <span>{props.whatsappStatus.detail}</span>}
+            <button className="secondary-button compact-action" onClick={props.onStartWhatsAppBridge} disabled={props.busy === "whatsapp-start"}>
+              <Bot size={15} />
+              {props.busy === "whatsapp-start" ? "Setting up" : "Start bridge"}
+            </button>
+          </div>
+        )}
         <div className="contact-list chat-list">
-          {props.imessageChats.length === 0 && (
+          {chats.length === 0 && (
             <div className="empty-list">
-              <p>No iMessage chats loaded yet.</p>
-              <small>Grant Full Disk Access to the app if refresh fails.</small>
+              <p>No {platformLabel} chats loaded yet.</p>
+              <small>
+                {props.channel === "whatsapp"
+                  ? "Start the bridge, scan the QR code, then refresh WhatsApp."
+                  : "Grant Full Disk Access to the app if refresh fails."}
+              </small>
             </div>
           )}
-          {props.imessageChats.length > 0 && visibleChats.length === 0 && (
+          {chats.length > 0 && visibleChats.length === 0 && (
             <div className="empty-list">
               <p>No matches.</p>
               <small>Try a name, phone number, group, or recent message text.</small>
@@ -1237,16 +1802,16 @@ function Workbench(props: {
           )}
           {visibleChats.map((chat) => (
             <button
-              className={`contact-row ${props.selectedChatId === chat.chatId ? "active" : ""}`}
+              className={`contact-row ${selectedChatId === chat.chatId ? "active" : ""}`}
               key={chat.chatId}
-              onClick={() => props.setSelectedChatId(chat.chatId)}
+              onClick={() => setSelectedChatId(chat.chatId)}
             >
-              <span className="avatar private-avatar">{initials(chat.displayName || chat.chatIdentifier || "IM")}</span>
+              <span className="avatar private-avatar">{initials(chat.displayName || chat.chatIdentifier || platformLabel)}</span>
               <span>
                 <strong className="private-text">{chat.displayName || chat.chatIdentifier || "Unnamed chat"}</strong>
                 <small className="private-text">
                   {chat.contactName && !chat.isGroup ? `${chat.chatIdentifier} - ` : ""}
-                  {chat.isGroup ? "group" : "iMessage"} {chat.lastMessageAt ? `- ${chat.lastMessageAt}` : ""}
+                  {chat.isGroup ? "group" : platformLabel} {chat.lastMessageAt ? `- ${chat.lastMessageAt}` : ""}
                 </small>
               </span>
             </button>
@@ -1257,8 +1822,8 @@ function Workbench(props: {
       <section className="composer-panel">
         <div className="panel-title-row">
           <div>
-            <span className="eyebrow">Selected iMessage thread</span>
-            <h2 className="private-text">{selected?.displayName || selectedChat?.displayName || "Choose an iMessage chat"}</h2>
+            <span className="eyebrow">Selected {platformLabel} thread</span>
+            <h2 className="private-text">{selected?.displayName || selectedChat?.displayName || `Choose a ${platformLabel} chat`}</h2>
           </div>
           <div className={`mode-pill ${botRunning ? "live" : "safe"}`}>{botRunning ? "Bot running" : "Bot off"}</div>
         </div>
@@ -1291,14 +1856,14 @@ function Workbench(props: {
             <strong>{botRunning ? "Bot is chatting with this person" : "Press Start bot to let it handle this chat"}</strong>
             <p>
               {botRunning
-                ? "SocializeAI is watching this selected iMessage thread and can send live low-risk replies automatically."
-                : "Start bot turns on live iMessage replies for this selected thread only, then checks the latest message."}
+                ? `SocializeAI is watching this selected ${platformLabel} thread and can send live low-risk replies automatically.`
+                : `Start bot turns on live ${platformLabel} replies for this thread, then checks the latest message.`}
             </p>
           </div>
           <button
             className={botRunning ? "secondary-button stop-bot-button" : "primary-button start-bot-button"}
             onClick={botRunning ? props.onStopBot : props.onStartBot}
-            disabled={!selectedChat || selected?.platform !== "imessage" || props.busy === "bot"}
+            disabled={!selectedChat || selected?.platform !== props.channel || props.busy === "bot"}
           >
             {botRunning ? <ShieldCheck size={18} /> : <Bot size={18} />}
             {botButtonLabel}
@@ -1353,10 +1918,40 @@ function Workbench(props: {
             <span className="eyebrow">Conversation</span>
             <h2 className="private-text">{selected?.displayName || selectedChat?.displayName || "Chat"}</h2>
           </div>
-          <button className="icon-button" disabled={!selected || selected.platform !== "imessage" || props.busy === "import"} onClick={props.onRefreshThread} title="Reload chat">
+          <button className="icon-button" disabled={!selected || selected.platform !== props.channel || props.busy === "import"} onClick={props.onRefreshThread} title="Reload chat">
             <RefreshCw size={17} />
           </button>
         </div>
+
+        {props.threadAccessIssue && (
+          <div className={`thread-access-card ${props.threadAccessIssue.needsFullDiskAccess ? "warn" : ""}`}>
+            <div className="thread-access-icon">
+              <AlertTriangle size={20} />
+            </div>
+            <div>
+              <span className="eyebrow">{props.threadAccessIssue.platform === "imessage" ? "iMessage access" : "Thread access"}</span>
+              <strong>{props.threadAccessIssue.title}</strong>
+              <p>{props.threadAccessIssue.message}</p>
+              {props.threadAccessIssue.detail && <small>{props.threadAccessIssue.detail}</small>}
+              <div className="thread-access-actions">
+                {props.threadAccessIssue.needsFullDiskAccess && (
+                  <button className="primary-button" onClick={props.onOpenPermissions}>
+                    <ShieldCheck size={16} />
+                    Full Disk Access
+                  </button>
+                )}
+                <button className="secondary-button" onClick={props.onCheckPermissions} disabled={props.busy === "permissions"}>
+                  <Check size={16} />
+                  {props.busy === "permissions" ? "Checking" : "Check access"}
+                </button>
+                <button className="secondary-button" onClick={props.onRefreshThread} disabled={props.busy === "import"}>
+                  <RefreshCw size={16} />
+                  Reload chat
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         <div className="chat-thread">
           {chatBubbles.length > 0 ? (
@@ -1415,7 +2010,7 @@ function Workbench(props: {
                 <RefreshCw size={16} />
                 Regenerate
               </button>
-              <button className="primary-button" onClick={props.onSendPendingNow} disabled={props.busy === "bot-send"}>
+              <button className="primary-button" onClick={() => props.onSendPendingNow()} disabled={props.busy === "bot-send"}>
                 <Send size={16} />
                 Send now
               </button>
@@ -1574,7 +2169,7 @@ function ContactsPanel(props: {
             <span>Platform</span>
             <select value={contact.platform} onChange={(event) => props.setContactDraft({ ...contact, platform: event.target.value as Platform })}>
               <option value="imessage">iMessage</option>
-              <option value="whatsapp">WhatsApp Business</option>
+              <option value="whatsapp">WhatsApp</option>
               <option value="manual">Manual draft</option>
             </select>
           </label>
@@ -1640,10 +2235,13 @@ function SettingsPanel(props: {
   settings: AppSettings;
   updateSettings: (patch: Partial<AppSettings>) => void;
   permissionReport: MacPermissionReport | null;
+  whatsappStatus: WhatsAppBridgeStatus | null;
   busy: string | null;
   onSave: () => void;
   onTest: () => void;
   onCheckPermissions: () => void;
+  onCheckWhatsApp: () => void;
+  onStartWhatsApp: () => void;
   onOpenPermissions: () => void;
   onReveal: () => void;
 }) {
@@ -1659,15 +2257,34 @@ function SettingsPanel(props: {
         </div>
         <ProviderSettings settings={props.settings} updateSettings={props.updateSettings} compact />
         <div className="divider" />
+        <label className="field-block">
+          <span>General prompt</span>
+          <textarea
+            className="private-field"
+            value={props.settings.globalUserContext}
+            onChange={(event) => props.updateSettings({ globalUserContext: event.target.value })}
+            rows={6}
+            placeholder="Name, background, personal facts, links, and standing style rules for every reply."
+          />
+        </label>
+        <div className="setting-note">
+          Sent to the model for every generated message. Per-chat relationship memory and optional instructions still stay with each conversation.
+        </div>
+        <div className="divider" />
         <div className="split-fields compact">
+          <Toggle
+            label="Dark mode"
+            checked={props.settings.darkModeEnabled}
+            onChange={(checked) => props.updateSettings({ darkModeEnabled: checked })}
+          />
           <Toggle
             label="Blur private details"
             checked={props.settings.privacyBlurEnabled}
             onChange={(checked) => props.updateSettings({ privacyBlurEnabled: checked })}
           />
-          <div className="setting-note">
-            Screen-share mode blurs names, handles, message text, and logs while keeping controls usable.
-          </div>
+        </div>
+        <div className="setting-note">
+          Dark mode changes the whole app. Screen-share mode blurs names, handles, message text, and logs while keeping controls usable.
         </div>
         <div className="divider" />
         <div className="split-fields compact">
@@ -1683,16 +2300,33 @@ function SettingsPanel(props: {
           />
         </div>
         <div className="split-fields compact">
-          <Toggle
-            label="Require human approval"
-            checked={props.settings.requireHumanApproval}
-            onChange={(checked) => props.updateSettings({ requireHumanApproval: checked })}
-          />
+          <label className="field-block">
+            <span>Permission mode</span>
+            <select
+              value={props.settings.permissionMode}
+              onChange={(event) => {
+                const permissionMode = event.target.value as PermissionMode;
+                props.updateSettings({
+                  permissionMode,
+                  requireHumanApproval: permissionMode === "extra_safe"
+                });
+              }}
+            >
+              {permissionModeOptions.map((option) => (
+                <option value={option.value} key={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
           <Toggle
             label="Autopilot enabled"
             checked={props.settings.autopilotEnabled}
             onChange={(checked) => props.updateSettings({ autopilotEnabled: checked })}
           />
+        </div>
+        <div className="setting-note">
+          {permissionModeOptions.find((option) => option.value === props.settings.permissionMode)?.description}
         </div>
         <div className="split-fields compact">
           <label className="field-block">
@@ -1723,7 +2357,7 @@ function SettingsPanel(props: {
             onChange={(checked) => props.updateSettings({ appendDisclosure: checked })}
           />
           <div className="setting-note">
-            Autopilot only scans saved iMessage chats with per-chat autopilot enabled. Dry run keeps it from sending while you test.
+            Autopilot only scans saved iMessage or WhatsApp chats with per-chat autopilot enabled. Dry run keeps it from sending while you test.
           </div>
         </div>
         <label className="field-block">
@@ -1758,6 +2392,72 @@ function SettingsPanel(props: {
               </div>
             );
           })}
+        </div>
+        <div className="divider" />
+        <div className="panel-title-row compact-title">
+          <div>
+            <span className="eyebrow">WhatsApp</span>
+            <h3 className="subheading">Personal bridge</h3>
+          </div>
+          <div className="button-cluster">
+            <button className="secondary-button" onClick={props.onStartWhatsApp} disabled={props.busy === "whatsapp-start"}>
+              <Bot size={16} />
+              {props.busy === "whatsapp-start" ? "Setting up" : "Start bridge"}
+            </button>
+            <button className="secondary-button" onClick={props.onCheckWhatsApp} disabled={props.busy === "whatsapp"}>
+              <ShieldCheck size={16} />
+              {props.busy === "whatsapp" ? "Checking" : "Check bridge"}
+            </button>
+          </div>
+        </div>
+        <div className={`permission-row ${props.whatsappStatus?.ok ? "ok" : "warn"}`}>
+          <strong>{props.whatsappStatus?.message || "WhatsApp bridge not checked yet."}</strong>
+          <span>
+            {props.whatsappStatus?.detail ||
+              "Run the maintained whatsmeow bridge, scan the QR code, then set the bridge URL, token, and messages DB path here."}
+          </span>
+        </div>
+        <div className="split-fields compact">
+          <label className="field-block">
+            <span>Bridge API URL</span>
+            <input
+              value={props.settings.whatsappBridgeUrl}
+              onChange={(event) => props.updateSettings({ whatsappBridgeUrl: event.target.value })}
+              placeholder="http://127.0.0.1:8080/api"
+            />
+          </label>
+          <label className="field-block">
+            <span>Bridge token</span>
+            <input
+              type="password"
+              value={props.settings.whatsappBridgeToken}
+              onChange={(event) => props.updateSettings({ whatsappBridgeToken: event.target.value })}
+              placeholder="Stored in whatsapp-bridge/store/.bridge-token"
+            />
+          </label>
+        </div>
+        <label className="field-block">
+          <span>Messages DB path</span>
+          <input
+            value={props.settings.whatsappMessagesDbPath}
+            onChange={(event) => props.updateSettings({ whatsappMessagesDbPath: event.target.value })}
+            placeholder="~/path/to/whatsapp-mcp/whatsapp-bridge/store/messages.db"
+          />
+        </label>
+        <div className="split-fields compact">
+          <label className="field-block">
+            <span>WhatsApp connector</span>
+            <select
+              value={props.settings.whatsappProvider}
+              onChange={(event) => props.updateSettings({ whatsappProvider: event.target.value as AppSettings["whatsappProvider"] })}
+            >
+              <option value="personal_bridge">Personal bridge</option>
+              <option value="business_cloud">Business Cloud API</option>
+            </select>
+          </label>
+          <div className="setting-note">
+            Personal bridge is the default for your own WhatsApp account. Business Cloud remains available for official business numbers.
+          </div>
         </div>
         <div className="divider" />
         <h3 className="subheading">WhatsApp Business Cloud API</h3>

@@ -6,7 +6,8 @@ import type {
   IMessageChat,
   ImportHistoryRequest,
   SendMessageRequest,
-  SocializeAIAPI
+  SocializeAIAPI,
+  WhatsAppChat
 } from "./shared";
 import { defaultSettings } from "./shared";
 
@@ -74,11 +75,20 @@ function appendDisclosureToText(settings: AppSettings, rawText: string) {
   return `${text}\n\n${disclosure}`;
 }
 
+function contactRoutingKey(contact: { platform: string; chatGuid?: string; chatId?: string; handle?: string; id: string }) {
+  const channelId =
+    contact.platform === "imessage"
+      ? contact.chatGuid || contact.chatId || contact.handle || contact.id
+      : contact.chatId || contact.handle || contact.id;
+  return `${contact.platform}:${channelId}`;
+}
+
 function previewDraft(request: DraftRequest, settings: AppSettings): DraftResult {
   const text = request.currentMessage.trim();
   const lower = `${text} ${request.conversationContext}`.toLowerCase();
   const risky = /(password|hurt myself|suicide|loan|borrow|lawyer|doctor|diagnosis|break up)/.test(lower);
   const scheduling = /(meet|dinner|lunch|time|tomorrow|tonight|later|free)/.test(lower);
+  const canAutoSend = settings.permissionMode === "dangerously_skip" || settings.permissionMode === "auto_review" || (!risky && settings.permissionMode === "safe");
   const draftText = scheduling
     ? "Yeah that works for me. Send me the time and I will make it happen."
     : text
@@ -89,11 +99,11 @@ function previewDraft(request: DraftRequest, settings: AppSettings): DraftResult
     messageParts: [draftText],
     confidence: 0.62,
     riskLevel: risky ? "high" : "low",
-    requiresHumanReview: true,
+    requiresHumanReview: settings.permissionMode === "extra_safe" || (settings.permissionMode !== "dangerously_skip" && risky),
     reasonCodes: risky ? ["unknown_context"] : scheduling ? ["scheduling"] : ["routine_ack"],
     sendEligibility: {
-      canAutoSend: false,
-      explanation: "Browser preview always requires approval. Electron uses the configured provider."
+      canAutoSend,
+      explanation: settings.permissionMode === "extra_safe" ? "Extra safe mode asks before every send." : "Browser preview uses the selected permission mode."
     },
     memoryUpdates: request.relationshipMemory
       ? []
@@ -170,7 +180,58 @@ export function installBrowserApiFallback() {
         ok: false,
         messages: "",
         count: 0,
-        message: "iMessage import is available only inside the Electron app."
+        message: "iMessage import is available only inside the Electron app.",
+        code: "preview_only"
+      };
+    },
+    async getWhatsAppBridgeStatus() {
+      return {
+        ok: false,
+        connected: false,
+        bridgeUrl: "http://127.0.0.1:8080/api",
+        tokenConfigured: false,
+        setupAction: "run_electron",
+        message: "WhatsApp bridge checks are available only inside the Electron app.",
+        detail: "Browser preview can show saved WhatsApp contacts, but it cannot read a local WhatsApp bridge database."
+      };
+    },
+    async startWhatsAppBridge() {
+      return {
+        ok: false,
+        connected: false,
+        bridgeUrl: "http://127.0.0.1:8080/api",
+        tokenConfigured: false,
+        setupAction: "run_electron",
+        message: "Start bridge is available only inside the Electron app.",
+        detail: "Use the packaged app to install or open the local WhatsApp bridge."
+      };
+    },
+    async listWhatsAppChats() {
+      return readState()
+        .contacts.filter((contact) => contact.platform === "whatsapp")
+        .map(
+          (contact): WhatsAppChat => ({
+            chatId: contact.chatId || contact.handle || contact.id,
+            jid: contact.chatId || contact.handle || contact.id,
+            displayName: contact.displayName || contact.handle || "Preview WhatsApp chat",
+            contactName: contact.displayName || undefined,
+            chatIdentifier: contact.handle || contact.chatId || contact.id,
+            serviceName: "WhatsApp",
+            participantHandles: contact.handle ? [contact.handle] : [],
+            participantNames: contact.displayName ? [contact.displayName] : [],
+            isGroup: Boolean(contact.chatId?.endsWith("@g.us") || contact.handle.endsWith("@g.us")),
+            lastMessageAt: new Date().toLocaleString(),
+            lastText: "Preview WhatsApp inbound message"
+          })
+        );
+    },
+    async importWhatsAppHistory(_request: ImportHistoryRequest) {
+      const at = new Date().toISOString().slice(0, 19).replace("T", " ");
+      return {
+        ok: true,
+        messages: `${at} WhatsApp preview: Preview WhatsApp inbound message`,
+        count: 1,
+        message: "Loaded preview WhatsApp history."
       };
     },
     async runAutopilotOnce() {
@@ -206,6 +267,7 @@ export function installBrowserApiFallback() {
         status: "ready",
         message: "Preview reply is ready.",
         contact,
+        preparedContactKey: contactRoutingKey(contact),
         inboundHash: crypto.randomUUID(),
         inboundText: "Preview inbound message",
         draftText: appendDisclosureToText(state.settings, draft.draftText),

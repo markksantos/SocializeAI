@@ -1,8 +1,9 @@
 import { app, BrowserWindow, ipcMain, safeStorage, shell } from "electron";
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { createWriteStream } from "node:fs";
+import { access, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { arch, homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -12,6 +13,8 @@ const execFileAsync = promisify(execFile);
 
 type AiProvider = "openai" | "ollama" | "local-openai";
 type Platform = "imessage" | "whatsapp" | "manual";
+type WhatsAppProvider = "personal_bridge" | "business_cloud";
+type PermissionMode = "extra_safe" | "safe" | "auto_review" | "dangerously_skip";
 type RiskLevel = "low" | "medium" | "high" | "blocked";
 
 type AppSettings = {
@@ -23,11 +26,17 @@ type AppSettings = {
   localModel: string;
   localOpenAiBaseUrl: string;
   localOpenAiModel: string;
+  globalUserContext: string;
   iMessageDryRun: boolean;
   whatsappDryRun: boolean;
+  whatsappProvider: WhatsAppProvider;
+  whatsappBridgeUrl: string;
+  whatsappBridgeToken: string;
+  whatsappMessagesDbPath: string;
   whatsappAccessToken: string;
   whatsappPhoneNumberId: string;
   whatsappGraphVersion: string;
+  permissionMode: PermissionMode;
   requireHumanApproval: boolean;
   autopilotEnabled: boolean;
   autopilotIntervalMinutes: number;
@@ -35,6 +44,7 @@ type AppSettings = {
   appendDisclosure: boolean;
   disclosureText: string;
   privacyBlurEnabled: boolean;
+  darkModeEnabled: boolean;
 };
 
 type Contact = {
@@ -46,6 +56,7 @@ type Contact = {
   chatGuid?: string;
   relationship: string;
   notes: string;
+  userInstruction?: string;
   allowAutopilot: boolean;
   optedOut: boolean;
   lastImportedAt?: string;
@@ -65,6 +76,32 @@ type IMessageChat = {
   lastMessageAt: string;
   lastText: string;
   isGroup: boolean;
+};
+
+type WhatsAppChat = {
+  chatId: string;
+  jid: string;
+  displayName: string;
+  contactName?: string;
+  chatIdentifier: string;
+  serviceName: "WhatsApp";
+  participantHandles: string[];
+  participantNames?: string[];
+  lastMessageAt: string;
+  lastText: string;
+  isGroup: boolean;
+};
+
+type WhatsAppBridgeStatus = {
+  ok: boolean;
+  connected: boolean;
+  message: string;
+  bridgeUrl: string;
+  tokenConfigured: boolean;
+  databasePath?: string;
+  bridgePath?: string;
+  setupAction?: string;
+  detail?: string;
 };
 
 type AuditEvent = {
@@ -115,21 +152,35 @@ const defaultSettings: AppSettings = {
   localModel: "qwen3:8b",
   localOpenAiBaseUrl: "http://127.0.0.1:1234",
   localOpenAiModel: "qwen3.7",
+  globalUserContext: "",
   iMessageDryRun: true,
   whatsappDryRun: true,
+  whatsappProvider: "personal_bridge",
+  whatsappBridgeUrl: "http://127.0.0.1:8080/api",
+  whatsappBridgeToken: "",
+  whatsappMessagesDbPath: "",
   whatsappAccessToken: "",
   whatsappPhoneNumberId: "",
   whatsappGraphVersion: "v25.0",
+  permissionMode: "safe",
   requireHumanApproval: true,
   autopilotEnabled: false,
   autopilotIntervalMinutes: 10,
   maxAutoSendsPerRun: 3,
   appendDisclosure: false,
   disclosureText: "Sent with AI assistance.",
-  privacyBlurEnabled: false
+  privacyBlurEnabled: false,
+  darkModeEnabled: true
 };
 
 let autopilotTimer: NodeJS.Timeout | null = null;
+let managedWhatsAppBridgeProcess: ChildProcess | null = null;
+let managedWhatsAppBridgeRestartTimer: NodeJS.Timeout | null = null;
+let managedWhatsAppBridgeDesired = false;
+let managedWhatsAppBridgeLastSettings: AppSettings | null = null;
+let managedWhatsAppBridgeStarting: Promise<void> | null = null;
+let managedWhatsAppBridgeExitCount = 0;
+let managedWhatsAppBridgeFirstExitAt = 0;
 
 function nowIso() {
   return new Date().toISOString();
@@ -187,20 +238,22 @@ function decryptSecret(value: string | undefined) {
 }
 
 type DiskState = Omit<AppState, "settings"> & {
-  settings: Omit<AppSettings, "openAiApiKey" | "whatsappAccessToken"> & {
+  settings: Omit<AppSettings, "openAiApiKey" | "whatsappAccessToken" | "whatsappBridgeToken"> & {
     openAiApiKeyCipher?: string;
     whatsappAccessTokenCipher?: string;
+    whatsappBridgeTokenCipher?: string;
   };
 };
 
 function toDiskState(state: AppState): DiskState {
-  const { openAiApiKey, whatsappAccessToken, ...settings } = state.settings;
+  const { openAiApiKey, whatsappAccessToken, whatsappBridgeToken, ...settings } = state.settings;
   return {
     ...state,
     settings: {
       ...settings,
       openAiApiKeyCipher: encryptSecret(openAiApiKey),
-      whatsappAccessTokenCipher: encryptSecret(whatsappAccessToken)
+      whatsappAccessTokenCipher: encryptSecret(whatsappAccessToken),
+      whatsappBridgeTokenCipher: encryptSecret(whatsappBridgeToken)
     }
   };
 }
@@ -212,7 +265,8 @@ function fromDiskState(state: Partial<DiskState>): AppState {
       ...defaultSettings,
       ...settings,
       openAiApiKey: decryptSecret(settings.openAiApiKeyCipher),
-      whatsappAccessToken: decryptSecret(settings.whatsappAccessTokenCipher)
+      whatsappAccessToken: decryptSecret(settings.whatsappAccessTokenCipher),
+      whatsappBridgeToken: decryptSecret(settings.whatsappBridgeTokenCipher)
     },
     contacts: Array.isArray(state.contacts) ? state.contacts : [],
     audits: Array.isArray(state.audits) ? state.audits : []
@@ -320,21 +374,45 @@ const draftSchema = {
   }
 };
 
-function buildSystemPrompt() {
+function permissionModePrompt(settings: AppSettings) {
+  switch (settings.permissionMode) {
+    case "extra_safe":
+      return "Permission mode: extra safe. Draft normally, but assume the app will ask the user before any message sends.";
+    case "auto_review":
+      return "Permission mode: auto review. Only require review for ultra-sensitive medical, legal, financial, password/secret, emergency/self-harm, or truly unknown personal facts. Routine affection in established relationships and casual personal chat should not require review.";
+    case "dangerously_skip":
+      return "Permission mode: dangerously skip permissions. Do not return NEEDS_USER_INPUT and do not ask for review. If a personal fact is missing, write the most plausible casual answer from context, keep it vague when uncertain, and never use bracket placeholders.";
+    case "safe":
+    default:
+      return "Permission mode: safe. Require review for genuinely sensitive or ambiguous messages, but routine casual replies and established-relationship affection should be allowed.";
+  }
+}
+
+function buildSystemPrompt(settings: AppSettings) {
+  const missingFactRule =
+    settings.permissionMode === "dangerously_skip"
+      ? "If the reply needs a personal fact that is not in the conversation, make the most plausible casual answer from context. Keep it vague if uncertain. Do not return NEEDS_USER_INPUT and do not use placeholders."
+      : "If the reply needs a personal fact that is not in the conversation, global user context, relationship memory, contact notes, or user instruction, do not guess and do not use placeholders. This includes website, GitHub, Discord, Telegram, email, phone, social handles, or contact details. Return draft_text as NEEDS_USER_INPUT: followed by the missing fact.";
+  const reviewRule =
+    settings.permissionMode === "dangerously_skip"
+      ? "Do not require human review. Draft the best reply the user would plausibly send based on context."
+      : "If context is ambiguous or sensitive, require human review.";
   return [
     "You draft personal text replies on behalf of the app user.",
+    "Use the global user context for stable facts about the app user and standing style instructions.",
+    permissionModePrompt(settings),
     "Match the user's relationship-specific tone without inventing facts, plans, feelings, locations, money commitments, or promises.",
     "Use message_parts for separate outgoing text bubbles. Use 1 part for a normal reply, or 2-4 short parts when double/triple texting would sound more natural.",
     "draft_text must equal message_parts joined with a blank line between parts.",
     "If the other person sent multiple consecutive messages, reply to the full cluster, not only the last line.",
-    "If the reply needs a personal fact that is not in the conversation, relationship memory, contact notes, or user instruction, do not guess and do not use placeholders. This includes website, GitHub, Discord, Telegram, email, phone, social handles, or contact details. Return draft_text as NEEDS_USER_INPUT: followed by the missing fact.",
-    "If context is ambiguous or sensitive, require human review.",
+    missingFactRule,
+    reviewRule,
     "Never claim the user did something they did not say they did.",
     "Return only JSON matching the requested schema."
   ].join("\n");
 }
 
-function buildDraftPrompt(input: {
+function buildDraftPrompt(settings: AppSettings, input: {
   contact: Contact;
   currentMessage: string;
   conversationContext: string;
@@ -342,6 +420,9 @@ function buildDraftPrompt(input: {
   userInstruction: string;
 }) {
   return [
+    "Global user context and standing instructions:",
+    settings.globalUserContext.trim() || "none",
+    "",
     `Contact: ${input.contact.displayName || "Unknown"}`,
     `Platform: ${input.contact.platform}`,
     `Relationship: ${input.contact.relationship || "unspecified"}`,
@@ -488,13 +569,48 @@ function detectSensitiveReasons(text: string) {
   if (/(lawyer|attorney|court|lawsuit|contract|legal|police|arrest)/.test(lower)) {
     reasons.add("legal");
   }
-  if (/(break up|divorce|love you|romantic|sex|cheat|dating)/.test(lower)) {
+  if (/(break up|divorce|romantic|sex|cheat|dating)/.test(lower)) {
     reasons.add("romantic_or_sensitive");
   }
   if (/(angry|mad at me|fight|argument|upset|betray|lied|hate)/.test(lower)) {
     reasons.add("conflict");
   }
   return [...reasons];
+}
+
+function getPermissionMode(settings: AppSettings): PermissionMode {
+  return settings.permissionMode || "safe";
+}
+
+function hasUltraSensitiveReason(reasons: string[]) {
+  return reasons.some((reason) =>
+    ["password_or_secret", "self_harm_or_emergency", "medical_or_health", "financial", "legal", "platform_policy"].includes(reason)
+  );
+}
+
+function isEstablishedRomanticRelationship(contact: Contact) {
+  return /\b(fianc[eé]e?|wife|husband|spouse|partner|girlfriend|boyfriend)\b/i.test(`${contact.relationship}\n${contact.notes}`);
+}
+
+function isRoutineAffectionText(text: string) {
+  return /\b(i\s+love\s+you|love\s+you|ily)\b/i.test(text) && !/(break up|divorce|sex|cheat|dating|angry|fight|argument|upset|hate)/i.test(text);
+}
+
+function relaxRoutineAffectionRisk(contact: Contact, inbound: string, draft: DraftResult): DraftResult {
+  const combined = `${inbound}\n${draft.draftText}\n${draft.messageParts.join("\n")}`;
+  if (!isEstablishedRomanticRelationship(contact) || !isRoutineAffectionText(combined)) return draft;
+  const nonRomanticSensitive = detectSensitiveReasons(combined).filter((reason) => reason !== "romantic_or_sensitive");
+  if (nonRomanticSensitive.length > 0) return draft;
+  return {
+    ...draft,
+    riskLevel: draft.riskLevel === "blocked" ? "blocked" : "low",
+    requiresHumanReview: false,
+    reasonCodes: draft.reasonCodes.filter((reason) => reason !== "romantic_or_sensitive"),
+    sendEligibility: {
+      canAutoSend: true,
+      explanation: "Routine affection in an established relationship."
+    }
+  };
 }
 
 function applySafetyOverlay(result: DraftResult, textForScan: string): DraftResult {
@@ -537,8 +653,8 @@ async function generateDraftWithOpenAI(settings: AppSettings, request: unknown) 
     body: JSON.stringify({
       model,
       store: false,
-      instructions: buildSystemPrompt(),
-      input: buildDraftPrompt(input),
+      instructions: buildSystemPrompt(settings),
+      input: buildDraftPrompt(settings, input),
       text: {
         format: {
           type: "json_schema",
@@ -573,10 +689,10 @@ async function generateDraftWithOllama(settings: AppSettings, request: unknown) 
       stream: false,
       format: "json",
       messages: [
-        { role: "system", content: buildSystemPrompt() },
+        { role: "system", content: buildSystemPrompt(settings) },
         {
           role: "user",
-          content: `${buildDraftPrompt(input)}\n\nReturn JSON with keys: draft_text, message_parts, confidence, risk_level, requires_human_review, reason_codes, send_eligibility, memory_updates.`
+          content: `${buildDraftPrompt(settings, input)}\n\nReturn JSON with keys: draft_text, message_parts, confidence, risk_level, requires_human_review, reason_codes, send_eligibility, memory_updates.`
         }
       ]
     })
@@ -605,10 +721,10 @@ async function generateDraftWithLocalOpenAI(settings: AppSettings, request: unkn
       temperature: 0.4,
       response_format: { type: "json_object" },
       messages: [
-        { role: "system", content: buildSystemPrompt() },
+        { role: "system", content: buildSystemPrompt(settings) },
         {
           role: "user",
-          content: `${buildDraftPrompt(input)}\n\nReturn JSON with keys: draft_text, message_parts, confidence, risk_level, requires_human_review, reason_codes, send_eligibility, memory_updates.`
+          content: `${buildDraftPrompt(settings, input)}\n\nReturn JSON with keys: draft_text, message_parts, confidence, risk_level, requires_human_review, reason_codes, send_eligibility, memory_updates.`
         }
       ]
     })
@@ -703,7 +819,7 @@ async function sendIMessage(handle: string, text: string, chatGuid?: string) {
   return "";
 }
 
-async function sendWhatsApp(settings: AppSettings, handle: string, text: string) {
+async function sendWhatsAppBusiness(settings: AppSettings, handle: string, text: string) {
   if (!settings.whatsappAccessToken.trim()) throw new Error("WhatsApp access token is missing.");
   if (!settings.whatsappPhoneNumberId.trim()) throw new Error("WhatsApp phone number ID is missing.");
   const version = settings.whatsappGraphVersion.trim() || "v25.0";
@@ -731,8 +847,470 @@ async function sendWhatsApp(settings: AppSettings, handle: string, text: string)
   return typeof receiptId === "string" ? receiptId : undefined;
 }
 
+function whatsappBridgeApiUrl(settings: AppSettings) {
+  const raw = trimTrailingSlash(settings.whatsappBridgeUrl.trim() || defaultSettings.whatsappBridgeUrl);
+  return raw.endsWith("/api") ? raw : `${raw}/api`;
+}
+
+const WHATSAPP_BRIDGE_REPO_URL = "https://github.com/verygoodplugins/whatsapp-mcp.git";
+const GO_DOWNLOAD_INDEX_URL = "https://go.dev/dl/?mode=json";
+
+function managedWhatsAppRepoPath() {
+  return path.join(app.getPath("userData"), "whatsapp-mcp");
+}
+
+function managedWhatsAppBridgePath() {
+  return path.join(managedWhatsAppRepoPath(), "whatsapp-bridge");
+}
+
+function managedWhatsAppMessagesDbPath() {
+  return path.join(managedWhatsAppBridgePath(), "store", "messages.db");
+}
+
+function managedWhatsAppTokenPath() {
+  return path.join(managedWhatsAppBridgePath(), "store", ".bridge-token");
+}
+
+function managedWhatsAppBridgeLogPath() {
+  return path.join(app.getPath("userData"), "whatsapp-bridge.log");
+}
+
+function managedRuntimePath() {
+  return path.join(app.getPath("userData"), "runtime");
+}
+
+function managedGoRootPath() {
+  return path.join(managedRuntimePath(), "go");
+}
+
+function managedGoBinaryPath() {
+  return path.join(managedGoRootPath(), "bin", "go");
+}
+
+function normalizeLocalPath(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed === "~") return homedir();
+  if (trimmed.startsWith("~/")) return path.join(homedir(), trimmed.slice(2));
+  return trimmed;
+}
+
+function uniqueNonEmpty(values: string[]) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+async function fileExists(filePath: string) {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveCommandPath(command: string) {
+  const commonMacPaths: Record<string, string[]> = {
+    go: [managedGoBinaryPath(), "/usr/local/go/bin/go", "/opt/homebrew/bin/go", "/usr/local/bin/go"],
+    git: ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+  };
+  try {
+    const { stdout } = await execFileAsync("which", [command]);
+    const resolved = stdout.trim().split("\n")[0];
+    if (resolved) return resolved;
+  } catch {
+    // GUI-launched apps often have a smaller PATH than Terminal.
+  }
+  for (const candidate of commonMacPaths[command] || []) {
+    if (await fileExists(candidate)) return candidate;
+  }
+  return "";
+}
+
+function goDownloadArch() {
+  const cpu = arch();
+  if (cpu === "arm64") return "arm64";
+  if (cpu === "x64") return "amd64";
+  return "";
+}
+
+async function resolveGoDownload() {
+  if (process.platform !== "darwin") {
+    throw new Error("Automatic WhatsApp runtime setup currently supports macOS only.");
+  }
+  const fileArch = goDownloadArch();
+  if (!fileArch) throw new Error(`Unsupported Mac architecture for automatic Go setup: ${arch()}.`);
+
+  const response = await fetch(GO_DOWNLOAD_INDEX_URL);
+  if (!response.ok) throw new Error(`Go download index returned ${response.status}.`);
+  const releases = (await response.json()) as Array<{
+    version?: string;
+    stable?: boolean;
+    files?: Array<{ filename?: string; os?: string; arch?: string; kind?: string }>;
+  }>;
+  const release = releases.find((item) => item.stable && item.files?.some((file) => file.os === "darwin" && file.arch === fileArch && file.kind === "archive"));
+  const file = release?.files?.find((item) => item.os === "darwin" && item.arch === fileArch && item.kind === "archive");
+  if (!release?.version || !file?.filename) throw new Error("Could not find a stable macOS Go archive.");
+  return {
+    version: release.version,
+    url: `https://go.dev/dl/${file.filename}`
+  };
+}
+
+async function installManagedGoRuntime() {
+  const existing = managedGoBinaryPath();
+  if (await fileExists(existing)) return existing;
+
+  const download = await resolveGoDownload();
+  const runtimePath = managedRuntimePath();
+  const archivePath = path.join(runtimePath, `${download.version}.darwin-${goDownloadArch()}.tar.gz`);
+  await mkdir(runtimePath, { recursive: true });
+  await rm(managedGoRootPath(), { recursive: true, force: true });
+
+  const response = await fetch(download.url);
+  if (!response.ok) throw new Error(`Go runtime download returned ${response.status}.`);
+  await writeFile(archivePath, Buffer.from(await response.arrayBuffer()));
+  try {
+    await execFileAsync("tar", ["-xzf", archivePath, "-C", runtimePath], { timeout: 120000, maxBuffer: 1024 * 1024 * 10 });
+  } finally {
+    await rm(archivePath, { force: true }).catch(() => undefined);
+  }
+
+  if (!(await fileExists(existing))) throw new Error("The Go runtime archive extracted, but the go binary was not found.");
+  return existing;
+}
+
+async function ensureGoRuntime() {
+  const existing = await resolveCommandPath("go");
+  if (existing) return existing;
+  return installManagedGoRuntime();
+}
+
+function whatsAppDbCandidates(settings: AppSettings) {
+  const configured = normalizeLocalPath(settings.whatsappMessagesDbPath);
+  const repoNames = ["whatsapp-mcp", "whatsapp-mcp-main", "verygoodplugins-whatsapp-mcp"];
+  const roots = [
+    homedir(),
+    path.join(homedir(), "Documents"),
+    path.join(homedir(), "Developer"),
+    path.join(homedir(), "Projects"),
+    process.cwd()
+  ];
+  const commonCheckoutPaths = roots.flatMap((root) =>
+    repoNames.flatMap((repoName) => [
+      path.join(root, repoName, "whatsapp-bridge", "store", "messages.db"),
+      path.join(root, repoName, "store", "messages.db")
+    ])
+  );
+
+  return uniqueNonEmpty([
+    configured,
+    process.env.WHATSAPP_DB_PATH || "",
+    managedWhatsAppMessagesDbPath(),
+    path.join(app.getPath("userData"), "whatsapp-bridge", "store", "messages.db"),
+    path.join(process.cwd(), "whatsapp-bridge", "store", "messages.db"),
+    ...commonCheckoutPaths
+  ]);
+}
+
+async function resolveWhatsAppMessagesDbPath(settings: AppSettings) {
+  const configured = normalizeLocalPath(settings.whatsappMessagesDbPath);
+  const candidates = whatsAppDbCandidates(settings);
+
+  for (const candidate of candidates) {
+    if (await fileExists(candidate)) return candidate;
+  }
+
+  const managedCandidates = new Set([managedWhatsAppMessagesDbPath(), path.join(app.getPath("userData"), "whatsapp-bridge", "store", "messages.db")]);
+  const configuredLooksManaged = configured && managedCandidates.has(configured);
+  throw new Error(
+    configured && !configuredLooksManaged
+      ? `WhatsApp messages database was not found at ${configured}. Choose the bridge messages.db path or run Start bridge again.`
+      : "WhatsApp is not paired yet. Click Start bridge, scan the QR code in Terminal, then refresh WhatsApp chats."
+  );
+}
+
+async function resolveWhatsAppBridgeToken(settings: AppSettings) {
+  const configured = settings.whatsappBridgeToken.trim();
+  if (configured) return configured;
+  if (process.env.WHATSAPP_BRIDGE_TOKEN?.trim()) return process.env.WHATSAPP_BRIDGE_TOKEN.trim();
+
+  const tokenCandidates: string[] = [managedWhatsAppTokenPath()];
+  try {
+    const dbPath = await resolveWhatsAppMessagesDbPath(settings);
+    tokenCandidates.unshift(path.join(path.dirname(dbPath), ".bridge-token"));
+  } catch {
+    // The bridge may be starting before messages.db exists; still check the managed token path.
+  }
+
+  for (const tokenPath of uniqueNonEmpty(tokenCandidates)) {
+    try {
+      return (await readFile(tokenPath, "utf8")).trim();
+    } catch {
+      // Try the next likely token location.
+    }
+  }
+
+  return "";
+}
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+async function ensureWhatsAppBridgeCheckout() {
+  const repoPath = managedWhatsAppRepoPath();
+  const bridgePath = managedWhatsAppBridgePath();
+  if (await fileExists(bridgePath)) return bridgePath;
+
+  const gitPath = await resolveCommandPath("git");
+  if (!gitPath) throw new Error("Git is required to install the WhatsApp bridge. Install Git or Xcode Command Line Tools first, then click Start bridge again.");
+
+  await mkdir(path.dirname(repoPath), { recursive: true });
+  if (await fileExists(repoPath)) await rm(repoPath, { recursive: true, force: true });
+  await execFileAsync(gitPath, ["clone", WHATSAPP_BRIDGE_REPO_URL, repoPath], { maxBuffer: 1024 * 1024 * 10 });
+  return bridgePath;
+}
+
+async function appendWhatsAppBridgeLog(message: string) {
+  const logPath = managedWhatsAppBridgeLogPath();
+  await mkdir(path.dirname(logPath), { recursive: true });
+  await writeFile(logPath, `${message}\n`, { flag: "a" });
+}
+
+function whatsAppBridgeEnv(goPath: string) {
+  const goRoot = path.dirname(path.dirname(goPath));
+  return {
+    ...process.env,
+    GOROOT: goRoot,
+    PATH: `${path.dirname(goPath)}:${process.env.PATH || ""}`
+  };
+}
+
+async function fetchWhatsAppBridgeHealth(settings: AppSettings, timeoutMs = 2500) {
+  const token = await resolveWhatsAppBridgeToken(settings);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${whatsappBridgeApiUrl(settings)}/health`, {
+      headers: whatsAppBridgeHeaders(token),
+      signal: controller.signal
+    });
+    const data = await response.json().catch(() => ({}));
+    return { response, data, token };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function waitForWhatsAppBridgeHealth(settings: AppSettings, timeoutMs = 10000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const health = await fetchWhatsAppBridgeHealth(settings, 1500);
+      if (health.response.status !== 0) return health;
+    } catch {
+      await sleep(700);
+    }
+  }
+  return null;
+}
+
+async function openWhatsAppBridgeLogTerminal() {
+  const logPath = managedWhatsAppBridgeLogPath();
+  await mkdir(path.dirname(logPath), { recursive: true });
+  await writeFile(logPath, "", { flag: "a" });
+  const command = `echo 'SocializeAI WhatsApp bridge log. Scan the QR code here when it appears.' && tail -n 200 -f ${shellQuote(logPath)}`;
+  const script = `
+    tell application "Terminal"
+      activate
+      do script ${JSON.stringify(command)}
+    end tell
+  `;
+  await execFileAsync("osascript", ["-e", script]);
+}
+
+async function startManagedWhatsAppBridgeProcess(settings: AppSettings, reason: string) {
+  if (settings.whatsappProvider !== "personal_bridge") return;
+  if (managedWhatsAppBridgeProcess && !managedWhatsAppBridgeProcess.killed) return;
+  if (managedWhatsAppBridgeStarting) return managedWhatsAppBridgeStarting;
+
+  managedWhatsAppBridgeDesired = true;
+  managedWhatsAppBridgeLastSettings = settings;
+
+  managedWhatsAppBridgeStarting = (async () => {
+    const bridgePath = await ensureWhatsAppBridgeCheckout();
+    const goPath = await ensureGoRuntime();
+    const logPath = managedWhatsAppBridgeLogPath();
+    await mkdir(path.dirname(logPath), { recursive: true });
+    await appendWhatsAppBridgeLog(`[${nowIso()}] Starting WhatsApp bridge (${reason}) from ${bridgePath}`);
+
+    const output = createWriteStream(logPath, { flags: "a" });
+    const child = spawn(goPath, ["run", "."], {
+      cwd: bridgePath,
+      env: whatsAppBridgeEnv(goPath),
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    managedWhatsAppBridgeProcess = child;
+    child.stdout.pipe(output, { end: false });
+    child.stderr.pipe(output, { end: false });
+    setTimeout(() => {
+      if (managedWhatsAppBridgeProcess === child) {
+        managedWhatsAppBridgeExitCount = 0;
+        managedWhatsAppBridgeFirstExitAt = 0;
+      }
+    }, 30000);
+    child.on("exit", (code, signal) => {
+      output.write(`\n[${nowIso()}] WhatsApp bridge exited with code ${code ?? "null"} signal ${signal ?? "none"}.\n`);
+      output.end();
+      if (managedWhatsAppBridgeProcess === child) managedWhatsAppBridgeProcess = null;
+      const exitedAt = Date.now();
+      if (!managedWhatsAppBridgeFirstExitAt || exitedAt - managedWhatsAppBridgeFirstExitAt > 60000) {
+        managedWhatsAppBridgeFirstExitAt = exitedAt;
+        managedWhatsAppBridgeExitCount = 0;
+      }
+      managedWhatsAppBridgeExitCount += 1;
+      if (managedWhatsAppBridgeExitCount > 5) {
+        void appendWhatsAppBridgeLog(`[${nowIso()}] WhatsApp bridge restart paused after repeated exits. Click Start bridge after checking the log.`);
+        return;
+      }
+      if (managedWhatsAppBridgeDesired && managedWhatsAppBridgeLastSettings && !managedWhatsAppBridgeRestartTimer) {
+        managedWhatsAppBridgeRestartTimer = setTimeout(() => {
+          managedWhatsAppBridgeRestartTimer = null;
+          void startManagedWhatsAppBridgeProcess(managedWhatsAppBridgeLastSettings!, "restart after exit").catch((error) =>
+            appendWhatsAppBridgeLog(`[${nowIso()}] Bridge restart failed: ${errorMessage(error)}`)
+          );
+        }, 4000);
+      }
+    });
+    child.on("error", (error) => {
+      void appendWhatsAppBridgeLog(`[${nowIso()}] WhatsApp bridge process error: ${errorMessage(error)}`);
+    });
+  })();
+
+  try {
+    await managedWhatsAppBridgeStarting;
+  } finally {
+    managedWhatsAppBridgeStarting = null;
+  }
+}
+
+async function ensureWhatsAppBridgeRunning(settings: AppSettings, reason: string) {
+  if (settings.whatsappProvider !== "personal_bridge") return;
+  try {
+    await fetchWhatsAppBridgeHealth(settings);
+    return;
+  } catch {
+    await startManagedWhatsAppBridgeProcess(settings, reason);
+    await waitForWhatsAppBridgeHealth(settings, 8000);
+  }
+}
+
+async function startWhatsAppBridge(settings: AppSettings): Promise<WhatsAppBridgeStatus> {
+  const bridgeUrl = whatsappBridgeApiUrl(settings);
+  const bridgePath = managedWhatsAppBridgePath();
+  const expectedDbPath = managedWhatsAppMessagesDbPath();
+  const hadManagedRuntimeBeforeStart = await fileExists(managedGoBinaryPath());
+  try {
+    await startManagedWhatsAppBridgeProcess(settings, "manual start");
+    await openWhatsAppBridgeLogTerminal();
+  } catch (error) {
+    return {
+      ok: false,
+      connected: false,
+      bridgeUrl,
+      tokenConfigured: Boolean(await resolveWhatsAppBridgeToken(settings)),
+      databasePath: (await fileExists(expectedDbPath)) ? expectedDbPath : undefined,
+      bridgePath,
+      setupAction: errorMessage(error).includes("Git is required") ? "install_git" : "runtime_install_failed",
+      message: "Could not start the WhatsApp bridge.",
+      detail: errorMessage(error)
+    };
+  }
+
+  const health = await waitForWhatsAppBridgeHealth(settings, 6000);
+  const connected = Boolean(health && health.response.ok && (health.data as Record<string, unknown>).connected);
+  const databasePath = (await fileExists(expectedDbPath)) ? expectedDbPath : undefined;
+  const installedManagedRuntime = !hadManagedRuntimeBeforeStart && (await fileExists(managedGoBinaryPath()));
+  return {
+    ok: connected && Boolean(databasePath),
+    connected,
+    bridgeUrl,
+    tokenConfigured: Boolean(await resolveWhatsAppBridgeToken(settings)),
+    databasePath,
+    bridgePath,
+    setupAction: connected && databasePath ? undefined : "scan_qr",
+    message: connected ? "WhatsApp bridge is running." : "WhatsApp bridge is starting.",
+    detail: `${installedManagedRuntime ? "SocializeAI installed a private Go runtime for the bridge. " : ""}Terminal now shows the bridge log and QR code if pairing is needed. SocializeAI will keep the bridge running while the app is open.`
+  };
+}
+
+function whatsAppBridgeHeaders(token: string) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
+function normalizeWhatsAppRecipient(handle: string) {
+  const trimmed = handle.trim();
+  if (!trimmed) throw new Error("This WhatsApp chat needs a recipient JID or phone number.");
+  if (trimmed.includes("@")) return trimmed;
+  const digits = trimmed.replace(/\D/g, "");
+  if (!digits) throw new Error("This WhatsApp chat needs a recipient JID or phone number.");
+  return `${digits}@s.whatsapp.net`;
+}
+
+async function sendWhatsAppPersonal(settings: AppSettings, handle: string, text: string) {
+  await ensureWhatsAppBridgeRunning(settings, "send");
+  const apiUrl = whatsappBridgeApiUrl(settings);
+  const token = await resolveWhatsAppBridgeToken(settings);
+  const response = await fetch(`${apiUrl}/send`, {
+    method: "POST",
+    headers: whatsAppBridgeHeaders(token),
+    body: JSON.stringify({
+      recipient: normalizeWhatsAppRecipient(handle),
+      message: text
+    })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (response.status === 401) {
+    throw new Error("WhatsApp bridge rejected the request. Paste the bridge token from store/.bridge-token in Settings, then save.");
+  }
+  if (!response.ok) throw new Error(extractApiError(data, `WhatsApp bridge returned ${response.status}.`));
+  if (data && typeof data === "object" && (data as Record<string, unknown>).success === false) {
+    throw new Error(extractApiError(data, "WhatsApp bridge could not send the message."));
+  }
+  const message = data && typeof data === "object" ? (data as Record<string, unknown>).message : undefined;
+  return typeof message === "string" && message ? message : "sent";
+}
+
 function messagesDbPath() {
   return path.join(homedir(), "Library", "Messages", "chat.db");
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isMessagesDbAccessDenied(error: unknown) {
+  const message = errorMessage(error).toLowerCase();
+  return (
+    message.includes("authorization denied") ||
+    message.includes("operation not permitted") ||
+    message.includes("not authorized") ||
+    (message.includes("unable to open database") && message.includes("library/messages/chat.db"))
+  );
+}
+
+function messagesFullDiskAccessDetail() {
+  return "macOS is blocking SocializeAI from reading Messages. Open Full Disk Access, add SocializeAI, then quit and relaunch the app. If it is already listed, remove it and add the rebuilt app again.";
+}
+
+function compactSqliteDiagnostic(error: unknown) {
+  const message = errorMessage(error);
+  if (/authorization denied/i.test(message)) return "sqlite3 could not open the Messages database: authorization denied.";
+  if (/operation not permitted/i.test(message)) return "sqlite3 could not open the Messages database: operation not permitted.";
+  if (/unable to open database/i.test(message)) return "sqlite3 could not open the Messages database.";
+  return message.replace(/\s+/g, " ").slice(0, 260);
 }
 
 let contactNameMap: Map<string, string> | null = null;
@@ -1050,6 +1628,309 @@ async function listIMessageChats(): Promise<IMessageChat[]> {
   });
 }
 
+function sqliteBool(value: unknown) {
+  return value === true || value === 1 || value === "1" || String(value).toLowerCase() === "true";
+}
+
+function formatLocalDateTime(date: Date) {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function formatWhatsAppTimestamp(value: unknown) {
+  if (value === null || typeof value === "undefined" || value === "") return "";
+  if (typeof value === "number") {
+    const ms = value > 1000000000000 ? value : value * 1000;
+    return formatLocalDateTime(new Date(ms));
+  }
+  const raw = String(value).trim();
+  if (/^\d+$/.test(raw)) {
+    const numeric = Number(raw);
+    const ms = numeric > 1000000000000 ? numeric : numeric * 1000;
+    return formatLocalDateTime(new Date(ms));
+  }
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) return formatLocalDateTime(parsed);
+  return raw.slice(0, 19);
+}
+
+function whatsAppNameFromJid(jid: string) {
+  return jid
+    .replace(/@s\.whatsapp\.net$/i, "")
+    .replace(/@g\.us$/i, "")
+    .replace(/@lid$/i, "")
+    .replace(/@c\.us$/i, "");
+}
+
+function whatsAppDisplayName(name: string | null | undefined, jid: string) {
+  const resolved = name?.trim();
+  return resolved || whatsAppNameFromJid(jid) || jid || "WhatsApp chat";
+}
+
+function whatsAppMessageBody(content?: string | null, mediaType?: string | null, filename?: string | null) {
+  const text = content?.trim();
+  if (text) return text;
+  const media = mediaType?.trim();
+  if (media) return filename?.trim() ? `[${media}: ${filename.trim()}]` : `[${media}]`;
+  return "[No text content]";
+}
+
+async function sqliteColumnNames(dbPath: string, table: string) {
+  const rows = await querySqliteDb<{ name: string }>(dbPath, `PRAGMA table_info(${table});`);
+  return new Set(rows.map((row) => row.name));
+}
+
+async function listVeryGoodWhatsAppChats(dbPath: string): Promise<WhatsAppChat[]> {
+  const rows = await querySqliteDb<{
+    jid: string;
+    name?: string | null;
+    rawLastMessageAt?: string | number | null;
+    lastText?: string | null;
+    lastMediaType?: string | null;
+    lastFilename?: string | null;
+  }>(
+    dbPath,
+    `
+      SELECT
+        c.jid AS jid,
+        c.name AS name,
+        COALESCE(
+          (SELECT m.timestamp FROM messages m WHERE m.chat_jid = c.jid ORDER BY m.timestamp DESC LIMIT 1),
+          c.last_message_time
+        ) AS rawLastMessageAt,
+        (SELECT m.content FROM messages m WHERE m.chat_jid = c.jid ORDER BY m.timestamp DESC LIMIT 1) AS lastText,
+        (SELECT m.media_type FROM messages m WHERE m.chat_jid = c.jid ORDER BY m.timestamp DESC LIMIT 1) AS lastMediaType,
+        (SELECT m.filename FROM messages m WHERE m.chat_jid = c.jid ORDER BY m.timestamp DESC LIMIT 1) AS lastFilename
+      FROM chats c
+      ORDER BY rawLastMessageAt DESC
+      LIMIT 250;
+    `
+  );
+
+  return rows.map((row) => {
+    const isGroup = row.jid.endsWith("@g.us");
+    const displayName = whatsAppDisplayName(row.name, row.jid);
+    return {
+      chatId: row.jid,
+      jid: row.jid,
+      displayName,
+      contactName: isGroup ? undefined : displayName,
+      chatIdentifier: whatsAppNameFromJid(row.jid),
+      serviceName: "WhatsApp",
+      participantHandles: [row.jid],
+      participantNames: displayName ? [displayName] : [],
+      lastMessageAt: formatWhatsAppTimestamp(row.rawLastMessageAt),
+      lastText: whatsAppMessageBody(row.lastText, row.lastMediaType, row.lastFilename),
+      isGroup
+    };
+  });
+}
+
+async function listFelipeWhatsAppChats(dbPath: string): Promise<WhatsAppChat[]> {
+  const rows = await querySqliteDb<{
+    jid: string;
+    pushName?: string | null;
+    contactName?: string | null;
+    rawLastMessageAt?: string | number | null;
+    unreadCount?: number;
+    isGroup?: unknown;
+    lastText?: string | null;
+    lastMessageType?: string | null;
+  }>(
+    dbPath,
+    `
+      SELECT
+        c.jid AS jid,
+        c.push_name AS pushName,
+        c.contact_name AS contactName,
+        c.last_message_time AS rawLastMessageAt,
+        c.unread_count AS unreadCount,
+        c.is_group AS isGroup,
+        (SELECT m.text FROM messages m WHERE m.chat_jid = c.jid ORDER BY m.timestamp DESC LIMIT 1) AS lastText,
+        (SELECT m.message_type FROM messages m WHERE m.chat_jid = c.jid ORDER BY m.timestamp DESC LIMIT 1) AS lastMessageType
+      FROM chats c
+      ORDER BY c.last_message_time DESC
+      LIMIT 250;
+    `
+  );
+
+  return rows.map((row) => {
+    const isGroup = sqliteBool(row.isGroup) || row.jid.endsWith("@g.us");
+    const displayName = whatsAppDisplayName(row.contactName || row.pushName, row.jid);
+    return {
+      chatId: row.jid,
+      jid: row.jid,
+      displayName,
+      contactName: row.contactName || row.pushName || undefined,
+      chatIdentifier: whatsAppNameFromJid(row.jid),
+      serviceName: "WhatsApp",
+      participantHandles: [row.jid],
+      participantNames: displayName ? [displayName] : [],
+      lastMessageAt: formatWhatsAppTimestamp(row.rawLastMessageAt),
+      lastText: whatsAppMessageBody(row.lastText, row.lastMessageType),
+      isGroup
+    };
+  });
+}
+
+async function listWhatsAppChats(settings: AppSettings): Promise<WhatsAppChat[]> {
+  const dbPath = await resolveWhatsAppMessagesDbPath(settings);
+  const chatColumns = await sqliteColumnNames(dbPath, "chats");
+  if (chatColumns.has("contact_name") || chatColumns.has("push_name")) return listFelipeWhatsAppChats(dbPath);
+  return listVeryGoodWhatsAppChats(dbPath);
+}
+
+async function importVeryGoodWhatsAppHistory(dbPath: string, chatJid: string, limit: number) {
+  const rows = await querySqliteDb<{
+    sender: string;
+    content: string | null;
+    timestamp: string | number | null;
+    is_from_me: unknown;
+    media_type?: string | null;
+    filename?: string | null;
+  }>(
+    dbPath,
+    `
+      SELECT sender, content, timestamp, is_from_me, media_type, filename
+      FROM messages
+      WHERE chat_jid = '${escapeSql(chatJid)}'
+      ORDER BY timestamp DESC
+      LIMIT ${limit};
+    `
+  );
+  const chatRows = await querySqliteDb<{ name?: string | null }>(dbPath, `SELECT name FROM chats WHERE jid = '${escapeSql(chatJid)}' LIMIT 1;`).catch(() => []);
+  const chatName = chatRows[0]?.name || "";
+  return rows
+    .reverse()
+    .map((row) => {
+      const fromMe = sqliteBool(row.is_from_me);
+      const sender = fromMe ? "Me" : whatsAppDisplayName(chatName || row.sender, row.sender || chatJid);
+      return `${formatWhatsAppTimestamp(row.timestamp)} ${sender}: ${whatsAppMessageBody(row.content, row.media_type, row.filename)}`;
+    })
+    .join("\n");
+}
+
+async function importFelipeWhatsAppHistory(dbPath: string, chatJid: string, limit: number) {
+  const rows = await querySqliteDb<{
+    sender_jid: string;
+    sender_push_name?: string | null;
+    sender_contact_name?: string | null;
+    chat_name?: string | null;
+    text: string | null;
+    timestamp: string | number | null;
+    is_from_me: unknown;
+    message_type?: string | null;
+  }>(
+    dbPath,
+    `
+      SELECT sender_jid, sender_push_name, sender_contact_name, chat_name, text, timestamp, is_from_me, message_type
+      FROM messages_with_names
+      WHERE chat_jid = '${escapeSql(chatJid)}'
+      ORDER BY timestamp DESC
+      LIMIT ${limit};
+    `
+  );
+  return rows
+    .reverse()
+    .map((row) => {
+      const fromMe = sqliteBool(row.is_from_me);
+      const sender = fromMe ? "Me" : whatsAppDisplayName(row.sender_contact_name || row.sender_push_name || row.chat_name, row.sender_jid || chatJid);
+      return `${formatWhatsAppTimestamp(row.timestamp)} ${sender}: ${whatsAppMessageBody(row.text, row.message_type)}`;
+    })
+    .join("\n");
+}
+
+async function importWhatsAppHistory(settings: AppSettings, handle: string, limit: number, chatId?: string) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 40, 1), 500);
+  const chatJid = chatId || normalizeWhatsAppRecipient(handle);
+  if (settings.whatsappProvider === "personal_bridge") await ensureWhatsAppBridgeRunning(settings, "history import");
+  const dbPath = await resolveWhatsAppMessagesDbPath(settings);
+  const chatColumns = await sqliteColumnNames(dbPath, "chats");
+  const messages = chatColumns.has("contact_name") || chatColumns.has("push_name")
+    ? await importFelipeWhatsAppHistory(dbPath, chatJid, safeLimit)
+    : await importVeryGoodWhatsAppHistory(dbPath, chatJid, safeLimit);
+  return {
+    messages,
+    count: messages ? messages.split("\n").filter((line) => /^\d{4}-\d{2}-\d{2}/.test(line)).length : 0
+  };
+}
+
+async function getWhatsAppBridgeStatus(settings: AppSettings): Promise<WhatsAppBridgeStatus> {
+  const bridgeUrl = whatsappBridgeApiUrl(settings);
+  const token = await resolveWhatsAppBridgeToken(settings);
+  const bridgePath = managedWhatsAppBridgePath();
+  let databasePath = "";
+  let databaseDetail = "";
+  try {
+    databasePath = await resolveWhatsAppMessagesDbPath(settings);
+    databaseDetail = `Database found at ${databasePath}.`;
+  } catch (error) {
+    databaseDetail = error instanceof Error ? error.message : String(error);
+  }
+
+  try {
+    const response = await fetch(`${bridgeUrl}/health`, {
+      headers: whatsAppBridgeHeaders(token)
+    });
+    const data = await response.json().catch(() => ({}));
+    if (response.status === 401) {
+      return {
+        ok: false,
+        connected: false,
+        bridgeUrl,
+        tokenConfigured: Boolean(token),
+        databasePath,
+        bridgePath,
+        setupAction: "check_token",
+        message: "WhatsApp bridge is running but rejected the token.",
+        detail: "Paste the token from whatsapp-bridge/store/.bridge-token in Settings, then save."
+      };
+    }
+    if (!response.ok) {
+      return {
+        ok: false,
+        connected: false,
+        bridgeUrl,
+        tokenConfigured: Boolean(token),
+        databasePath,
+        bridgePath,
+        setupAction: databasePath ? "check_bridge" : "start_bridge",
+        message: `WhatsApp bridge returned ${response.status}.`,
+        detail: databaseDetail
+      };
+    }
+    const connected = Boolean((data as Record<string, unknown>).connected);
+    return {
+      ok: connected && Boolean(databasePath),
+      connected,
+      bridgeUrl,
+      tokenConfigured: Boolean(token),
+      databasePath,
+      bridgePath,
+      setupAction: connected && databasePath ? undefined : connected ? "wait_for_database" : "scan_qr",
+      message: connected ? "WhatsApp bridge is connected." : "WhatsApp bridge is reachable, but WhatsApp is not connected.",
+      detail: databaseDetail
+    };
+  } catch (error) {
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const networkDetail = /fetch failed|ECONNREFUSED|ECONNRESET|ECONNREFUSED|Failed to fetch/i.test(rawMessage) ? "" : ` ${rawMessage}`;
+    const detail = databasePath
+      ? `Click Start bridge to open the WhatsApp QR pairing window, then refresh WhatsApp chats.${networkDetail}`
+      : `Click Start bridge. SocializeAI will set up the local bridge runtime if needed, open Terminal, and show the WhatsApp QR code.${networkDetail}`;
+    return {
+      ok: false,
+      connected: false,
+      bridgeUrl,
+      tokenConfigured: Boolean(token),
+      databasePath,
+      bridgePath,
+      setupAction: "start_bridge",
+      message: "WhatsApp bridge is not running.",
+      detail: detail.trim()
+    };
+  }
+}
+
 function hashText(value: string) {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -1120,13 +2001,16 @@ async function dispatchApprovedMessage(state: AppState, contact: Contact, rawTex
   if (contact.platform === "whatsapp") {
     let receiptId: string | undefined;
     for (const [index, part] of parts.entries()) {
-      receiptId = await sendWhatsApp(state.settings, contact.handle, part);
+      receiptId =
+        state.settings.whatsappProvider === "business_cloud"
+          ? await sendWhatsAppBusiness(state.settings, contact.handle, part)
+          : await sendWhatsAppPersonal(state.settings, contact.chatId || contact.handle, part);
       if (index < parts.length - 1) await sleep(900);
     }
     return {
       ok: true,
       dryRun: false,
-      message: "WhatsApp Cloud API accepted the message.",
+      message: state.settings.whatsappProvider === "business_cloud" ? "WhatsApp Cloud API accepted the message." : "WhatsApp bridge sent the message.",
       receiptId,
       detail: text
     };
@@ -1142,6 +2026,7 @@ async function generateDraftWithSettings(settings: AppSettings, request: unknown
 }
 
 function contactMatchesContact(candidate: Contact, target: Contact) {
+  if (candidate.platform !== target.platform) return false;
   return (
     (!!candidate.chatId && candidate.chatId === target.chatId) ||
     (!!candidate.chatGuid && candidate.chatGuid === target.chatGuid) ||
@@ -1149,18 +2034,46 @@ function contactMatchesContact(candidate: Contact, target: Contact) {
   );
 }
 
+function contactRoutingKey(contact: Contact) {
+  const channelId =
+    contact.platform === "imessage"
+      ? contact.chatGuid || contact.chatId || contact.handle || contact.id
+      : contact.chatId || contact.handle || contact.id;
+  return `${contact.platform}:${channelId}`;
+}
+
 function findStoredContact(state: AppState, contact: Contact) {
   return state.contacts.find((item) => contactMatchesContact(item, contact));
 }
 
+async function importHistoryForContact(state: AppState, contact: Contact, limit: number) {
+  if (contact.platform === "imessage") return importIMessageHistory(contact.handle, limit, contact.chatId);
+  if (contact.platform === "whatsapp") return importWhatsAppHistory(state.settings, contact.handle, limit, contact.chatId);
+  throw new Error("Automatic replies need an iMessage or WhatsApp chat.");
+}
+
 function canAutoSendDraft(state: AppState, inbound: string, draft: { riskLevel: RiskLevel; requiresHumanReview: boolean; draftText: string; sendEligibility: { canAutoSend: boolean } }) {
+  const mode = getPermissionMode(state.settings);
+  const sensitiveReasons = detectSensitiveReasons(`${inbound}\n${draft.draftText}`);
+  if (mode === "extra_safe") return false;
+  if (mode === "dangerously_skip") return true;
+  if (mode === "auto_review") return draft.riskLevel !== "blocked" && !hasUltraSensitiveReason(sensitiveReasons);
   return (
     draft.riskLevel === "low" &&
     !draft.requiresHumanReview &&
     draft.sendEligibility.canAutoSend &&
-    !state.settings.requireHumanApproval &&
-    detectSensitiveReasons(`${inbound}\n${draft.draftText}`).length === 0
+    sensitiveReasons.length === 0
   );
+}
+
+function shouldHoldPreparedDraft(state: AppState, inbound: string, draft: DraftResult, forceReply: boolean) {
+  const mode = getPermissionMode(state.settings);
+  const sensitiveReasons = detectSensitiveReasons(`${inbound}\n${draft.draftText}\n${draft.messageParts.join("\n")}`);
+  if (mode === "extra_safe") return true;
+  if (mode === "dangerously_skip") return false;
+  if (mode === "auto_review") return draft.riskLevel === "blocked" || hasUltraSensitiveReason(sensitiveReasons);
+  if (forceReply) return draft.riskLevel === "high" || draft.riskLevel === "blocked" || sensitiveReasons.length > 0;
+  return !canAutoSendDraft(state, inbound, draft);
 }
 
 function parseTranscriptTimestamp(line: string) {
@@ -1214,7 +2127,16 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
   const forceReply = "contact" in request ? Boolean(request.forceReply) : false;
   const skipWait = "contact" in request ? Boolean(request.skipWait) : false;
   const userSuppliedInstruction = "contact" in request ? String(request.userInstruction || "").trim() : "";
-  const contact = findStoredContact(state, contactRequest) || contactRequest;
+  const storedContact = findStoredContact(state, contactRequest);
+  const contact = storedContact
+    ? {
+        ...storedContact,
+        notes: contactRequest.notes ?? storedContact.notes,
+        userInstruction: contactRequest.userInstruction ?? storedContact.userInstruction
+      }
+    : contactRequest;
+  const storedInstruction = String(contact.userInstruction || "").trim();
+  const combinedInstruction = [storedInstruction, userSuppliedInstruction].filter(Boolean).join("\n");
   const details: string[] = [];
   if (!contact.allowAutopilot) {
     return { ok: false, status: "idle", message: "Bot is not enabled for this chat.", contact, details };
@@ -1222,15 +2144,15 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
   if (contact.optedOut) {
     return { ok: false, status: "blocked", message: "This chat is marked opted out.", contact, details };
   }
-  if (contact.platform !== "imessage") {
-    return { ok: false, status: "blocked", message: "Automatic replies currently support iMessage chats only.", contact, details };
+  if (contact.platform !== "imessage" && contact.platform !== "whatsapp") {
+    return { ok: false, status: "blocked", message: "Automatic replies need an iMessage or WhatsApp chat.", contact, details };
   }
 
   try {
-    const imported = await importIMessageHistory(contact.handle, 40, contact.chatId);
+    const imported = await importHistoryForContact(state, contact, 40);
     const inbound = latestInboundLine(imported.messages);
     if (!inbound) {
-      return { ok: false, status: "idle", message: "No inbound iMessage found.", contact, details };
+      return { ok: false, status: "idle", message: `No inbound ${contact.platform === "whatsapp" ? "WhatsApp" : "iMessage"} message found.`, contact, details };
     }
     const waitSeconds = !skipWait && !regenerate && !userSuppliedInstruction ? secondsUntilInboundSettles(inbound) : 0;
     if (waitSeconds > 0) {
@@ -1239,6 +2161,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
         status: "waiting",
         message: `Waiting ${waitSeconds}s to see if they keep texting before replying.`,
         contact,
+        preparedContactKey: contactRoutingKey(contact),
         inboundText: inbound,
         waitSeconds,
         details: [`Latest inbound message is still fresh. Waiting avoids replying before a double/triple text finishes.`]
@@ -1249,7 +2172,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
       return { ok: false, status: "idle", message: "Latest inbound message already handled.", contact, inboundHash, inboundText: inbound, details };
     }
 
-    const draft = await generateDraftWithSettings(state.settings, {
+    let draft = await generateDraftWithSettings(state.settings, {
       contact,
       currentMessage: inbound,
       conversationContext: imported.messages,
@@ -1258,12 +2181,15 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
         regenerate
           ? "Autopilot mode. Regenerate a different concise, natural reply in the user's voice. Avoid repeating the previous wording. Only set can_auto_send true and requires_human_review false for simple low-risk acknowledgements, casual replies, or scheduling."
           : "Autopilot mode. Produce a concise, natural reply in the user's voice. Only set can_auto_send true and requires_human_review false for simple low-risk acknowledgements, casual replies, or scheduling.",
+        storedInstruction ? `Saved chat instruction: ${storedInstruction}` : "",
         userSuppliedInstruction ? `User-provided answer/instruction: ${userSuppliedInstruction}` : ""
       ]
         .filter(Boolean)
         .join("\n")
     });
-    const userInputReasons = detectUserInputNeed(inbound, draft, `${imported.messages}\n${contact.notes}`, userSuppliedInstruction);
+    draft = relaxRoutineAffectionRisk(contact, inbound, draft);
+    const userInputReasons =
+      getPermissionMode(state.settings) === "dangerously_skip" ? [] : detectUserInputNeed(inbound, draft, `${imported.messages}\n${contact.notes}\n${storedInstruction}`, combinedInstruction);
     if (userInputReasons.length > 0) {
       contact.lastAutopilotInboundHash = inboundHash;
       contact.lastAutopilotAt = nowIso();
@@ -1277,6 +2203,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
         status: "needs_input",
         message: "I need your answer before replying.",
         contact,
+        preparedContactKey: contactRoutingKey(contact),
         inboundHash,
         inboundText: inbound,
         draftText: draft.draftText,
@@ -1289,7 +2216,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
     const preparedParts = appendDisclosureToParts(state.settings, draft.messageParts);
     const preparedText = joinMessageParts(preparedParts);
 
-    if ((!forceReply || draft.riskLevel === "high") && !canAutoSendDraft(state, inbound, draft)) {
+    if (shouldHoldPreparedDraft(state, inbound, draft, forceReply)) {
       contact.lastAutopilotInboundHash = inboundHash;
       contact.lastAutopilotAt = nowIso();
       state.audits = [
@@ -1302,6 +2229,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
         status: "held",
         message: `Bot drafted a reply but held it for review (${draft.riskLevel}).`,
         contact,
+        preparedContactKey: contactRoutingKey(contact),
         inboundHash,
         inboundText: inbound,
         draftText: preparedText,
@@ -1325,6 +2253,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
       status: "ready",
       message: "Bot reply is ready to send.",
       contact,
+      preparedContactKey: contactRoutingKey(contact),
       inboundHash,
       inboundText: inbound,
       draftText: preparedText,
@@ -1340,10 +2269,20 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
   }
 }
 
-async function sendPreparedAutopilotReply(request: { contact: Contact; inboundHash: string; text: string; textParts?: string[] }) {
+async function sendPreparedAutopilotReply(request: { contact: Contact; preparedContactKey?: string; inboundHash: string; text: string; textParts?: string[] }) {
   const state = await readState();
   const contact = findStoredContact(state, request.contact) || request.contact;
   try {
+    const actualContactKey = contactRoutingKey(contact);
+    if (!request.preparedContactKey || request.preparedContactKey !== actualContactKey) {
+      const message = "Blocked: this prepared reply no longer matches the selected recipient.";
+      state.audits = [
+        createAudit("message_blocked", `Blocked mismatched bot send for ${contact.displayName}`, `Expected ${request.preparedContactKey || "missing"} but got ${actualContactKey}.`),
+        ...state.audits
+      ].slice(0, 500);
+      await writeState(state);
+      return { ok: false, dryRun: false, message, detail: message };
+    }
     const result = await dispatchApprovedMessage(state, contact, request.text, undefined, request.textParts);
     if (result.ok) {
       const stored = findStoredContact(state, contact);
@@ -1396,17 +2335,17 @@ async function runAutopilotOnce(source: "manual" | "timer") {
 
   for (const contact of state.contacts) {
     if (sent >= maxSends) break;
-    if (!contact.allowAutopilot || contact.optedOut || contact.platform !== "imessage") {
+    if (!contact.allowAutopilot || contact.optedOut || (contact.platform !== "imessage" && contact.platform !== "whatsapp")) {
       skipped += 1;
       continue;
     }
     scanned += 1;
     try {
-      const imported = await importIMessageHistory(contact.handle, 30, contact.chatId);
+      const imported = await importHistoryForContact(state, contact, 30);
       const inbound = latestInboundLine(imported.messages);
       if (!inbound) {
         skipped += 1;
-        details.push(`${contact.displayName}: no inbound iMessage found.`);
+        details.push(`${contact.displayName}: no inbound ${contact.platform === "whatsapp" ? "WhatsApp" : "iMessage"} message found.`);
         continue;
       }
       const waitSeconds = secondsUntilInboundSettles(inbound);
@@ -1435,17 +2374,24 @@ async function runAutopilotOnce(source: "manual" | "timer") {
         }
       }
 
-      const draft = await generateDraftWithSettings(state.settings, {
+      const storedInstruction = String(contact.userInstruction || "").trim();
+      let draft = await generateDraftWithSettings(state.settings, {
         contact,
         currentMessage: inbound,
         conversationContext: imported.messages,
         relationshipMemory: contact.notes,
-        userInstruction:
-          "Autopilot mode. Only mark can_auto_send true and requires_human_review false for simple low-risk acknowledgements or scheduling replies."
+        userInstruction: [
+          "Autopilot mode. Only mark can_auto_send true and requires_human_review false for simple low-risk acknowledgements or scheduling replies.",
+          storedInstruction ? `Saved chat instruction: ${storedInstruction}` : ""
+        ]
+          .filter(Boolean)
+          .join("\n")
       });
+      draft = relaxRoutineAffectionRisk(contact, inbound, draft);
       drafted += 1;
 
-      const userInputReasons = detectUserInputNeed(inbound, draft, `${imported.messages}\n${contact.notes}`, "");
+      const userInputReasons =
+        getPermissionMode(state.settings) === "dangerously_skip" ? [] : detectUserInputNeed(inbound, draft, `${imported.messages}\n${contact.notes}\n${storedInstruction}`, storedInstruction);
       if (userInputReasons.length > 0) {
         contact.lastAutopilotInboundHash = inboundHash;
         contact.lastAutopilotAt = nowIso();
@@ -1458,14 +2404,7 @@ async function runAutopilotOnce(source: "manual" | "timer") {
         continue;
       }
 
-      const canAutoSend =
-        draft.riskLevel === "low" &&
-        !draft.requiresHumanReview &&
-        draft.sendEligibility.canAutoSend &&
-        !state.settings.requireHumanApproval &&
-        detectSensitiveReasons(`${inbound}\n${draft.draftText}`).length === 0;
-
-      if (!canAutoSend) {
+      if (!canAutoSendDraft(state, inbound, draft)) {
         contact.lastAutopilotInboundHash = inboundHash;
         contact.lastAutopilotAt = nowIso();
         skipped += 1;
@@ -1591,7 +2530,7 @@ async function checkMacPermissions() {
   } catch (error) {
     messagesDatabase = {
       ...messagesDatabase,
-      detail: `Grant Full Disk Access to this app or the terminal launching it. ${error instanceof Error ? error.message : String(error)}`
+      detail: isMessagesDbAccessDenied(error) ? messagesFullDiskAccessDetail() : compactSqliteDiagnostic(error)
     };
   }
 
@@ -1611,7 +2550,7 @@ async function checkMacPermissions() {
   } catch (error) {
     contactsDatabase = {
       ...contactsDatabase,
-      detail: `Grant Contacts or Full Disk Access to this app. ${error instanceof Error ? error.message : String(error)}`
+      detail: "Grant Contacts or Full Disk Access to SocializeAI, then quit and relaunch the app."
     };
   }
 
@@ -1775,11 +2714,62 @@ ipcMain.handle("imessage:import-history", async (_event, request: { handle: stri
     await writeState(state);
     return { ok: true, count: result.count, messages: result.messages, message: `Imported ${result.count} messages.` };
   } catch (error) {
+    const accessDenied = isMessagesDbAccessDenied(error);
+    const summary = accessDenied ? "iMessage history import blocked" : "iMessage history import failed";
+    const detail = accessDenied ? "Full Disk Access is required for the Messages database." : compactSqliteDiagnostic(error);
+    state.audits = [createAudit("history_import_failed", summary, detail), ...state.audits].slice(0, 500);
+    await writeState(state);
     return {
       ok: false,
       count: 0,
       messages: "",
-      message: "Could not import iMessage history. Grant Full Disk Access to this app or paste context manually.",
+      message: accessDenied ? "Messages access is blocked." : "Could not import iMessage history.",
+      detail: accessDenied ? messagesFullDiskAccessDetail() : "Try reloading the thread. If this keeps happening, check Mac access in Settings.",
+      code: accessDenied ? "full_disk_access_required" : "history_import_failed",
+      needsFullDiskAccess: accessDenied
+    };
+  }
+});
+
+ipcMain.handle("whatsapp:bridge-status", async (_event, settings?: AppSettings) => {
+  const state = await readState();
+  return getWhatsAppBridgeStatus({ ...defaultSettings, ...state.settings, ...(settings || {}) });
+});
+
+ipcMain.handle("whatsapp:start-bridge", async (_event, settings?: AppSettings) => {
+  const state = await readState();
+  return startWhatsAppBridge({ ...defaultSettings, ...state.settings, ...(settings || {}) });
+});
+
+ipcMain.handle("whatsapp:list-chats", async () => {
+  const state = await readState();
+  try {
+    return await listWhatsAppChats(state.settings);
+  } catch (error) {
+    throw new Error(
+      `WhatsApp setup is not ready yet. Click Start bridge in Settings or the WhatsApp sidebar, scan the QR code, then refresh chats. ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+});
+
+ipcMain.handle("whatsapp:import-history", async (_event, request: { handle: string; chatId?: string; limit: number }) => {
+  const state = await readState();
+  try {
+    const result = await importWhatsAppHistory(state.settings, request.handle, request.limit, request.chatId);
+    state.audits = [
+      createAudit("history_imported", `Imported ${result.count} WhatsApp rows`, request.chatId ? `Chat: ${request.chatId}` : `Handle: ${request.handle}`),
+      ...state.audits
+    ].slice(0, 500);
+    await writeState(state);
+    return { ok: true, count: result.count, messages: result.messages, message: `Imported ${result.count} WhatsApp messages.` };
+  } catch (error) {
+    return {
+      ok: false,
+      count: 0,
+      messages: "",
+      message: "Could not import WhatsApp history. Start the personal WhatsApp bridge and set its messages DB path in Settings.",
       detail: error instanceof Error ? error.message : String(error)
     };
   }
@@ -1791,7 +2781,7 @@ ipcMain.handle("autopilot:prepare-reply", async (_event, request: Contact | { co
   prepareAutopilotReply(request)
 );
 
-ipcMain.handle("autopilot:send-prepared", async (_event, request: { contact: Contact; inboundHash: string; text: string; textParts?: string[] }) =>
+ipcMain.handle("autopilot:send-prepared", async (_event, request: { contact: Contact; preparedContactKey?: string; inboundHash: string; text: string; textParts?: string[] }) =>
   sendPreparedAutopilotReply(request)
 );
 

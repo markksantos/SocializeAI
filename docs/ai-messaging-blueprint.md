@@ -60,7 +60,7 @@ Limits:
 
 ### WhatsApp
 
-Use the WhatsApp Business Platform for official WhatsApp automation. WhatsApp Business policy requires opt-in, respect for opt-outs, approved templates for business-initiated outbound messages, and human escalation paths for automation.
+Use the WhatsApp Business Platform for official business automation. WhatsApp Business policy requires opt-in, respect for opt-outs, approved templates for business-initiated outbound messages, and human escalation paths for automation.
 
 Important policy implications:
 
@@ -69,7 +69,7 @@ Important policy implications:
 - Automation is allowed in the 24-hour window, but there must be prompt and clear escalation to a human/support path.
 - WhatsApp can limit or remove access for spammy, deceptive, unauthorized, or low-quality messaging.
 
-For this product, "text my friends and family via WhatsApp" is a product mismatch if it means using a personal WhatsApp account. The official API is business-oriented. If personal WhatsApp support is required, the safe product stance is manual handoff: generate a draft and let the user paste/send it themselves.
+For this product, "text my friends and family via WhatsApp" uses a different connector class than the official business API. The desktop app now supports a local personal WhatsApp bridge adapter for user-owned accounts: it reads a local bridge SQLite database and sends through a loopback REST API exposed by a whatsmeow-based bridge. This path is local-first and user-controlled, but it is not the official WhatsApp Business Platform and should remain clearly labeled as a personal bridge integration.
 
 ## Recommended Architecture
 

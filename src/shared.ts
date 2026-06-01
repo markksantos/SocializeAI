@@ -2,6 +2,12 @@ export type AiProvider = "openai" | "ollama" | "local-openai";
 
 export type Platform = "imessage" | "whatsapp" | "manual";
 
+export type MessagingChannel = "imessage" | "whatsapp";
+
+export type WhatsAppProvider = "personal_bridge" | "business_cloud";
+
+export type PermissionMode = "extra_safe" | "safe" | "auto_review" | "dangerously_skip";
+
 export type RiskLevel = "low" | "medium" | "high" | "blocked";
 
 export type SafetyReason =
@@ -28,11 +34,17 @@ export type AppSettings = {
   localModel: string;
   localOpenAiBaseUrl: string;
   localOpenAiModel: string;
+  globalUserContext: string;
   iMessageDryRun: boolean;
   whatsappDryRun: boolean;
+  whatsappProvider: WhatsAppProvider;
+  whatsappBridgeUrl: string;
+  whatsappBridgeToken: string;
+  whatsappMessagesDbPath: string;
   whatsappAccessToken: string;
   whatsappPhoneNumberId: string;
   whatsappGraphVersion: string;
+  permissionMode: PermissionMode;
   requireHumanApproval: boolean;
   autopilotEnabled: boolean;
   autopilotIntervalMinutes: number;
@@ -40,6 +52,7 @@ export type AppSettings = {
   appendDisclosure: boolean;
   disclosureText: string;
   privacyBlurEnabled: boolean;
+  darkModeEnabled: boolean;
 };
 
 export type Contact = {
@@ -51,6 +64,7 @@ export type Contact = {
   chatGuid?: string;
   relationship: string;
   notes: string;
+  userInstruction?: string;
   allowAutopilot: boolean;
   optedOut: boolean;
   lastImportedAt?: string;
@@ -70,6 +84,32 @@ export type IMessageChat = {
   lastMessageAt: string;
   lastText: string;
   isGroup: boolean;
+};
+
+export type WhatsAppChat = {
+  chatId: string;
+  jid: string;
+  displayName: string;
+  contactName?: string;
+  chatIdentifier: string;
+  serviceName: "WhatsApp";
+  participantHandles: string[];
+  participantNames?: string[];
+  lastMessageAt: string;
+  lastText: string;
+  isGroup: boolean;
+};
+
+export type WhatsAppBridgeStatus = {
+  ok: boolean;
+  connected: boolean;
+  message: string;
+  bridgeUrl: string;
+  tokenConfigured: boolean;
+  databasePath?: string;
+  bridgePath?: string;
+  setupAction?: string;
+  detail?: string;
 };
 
 export type DraftRequest = {
@@ -114,6 +154,7 @@ export type AuditEvent = {
     | "message_dry_run"
     | "contact_saved"
     | "history_imported"
+    | "history_import_failed"
     | "provider_test";
   summary: string;
   detail?: string;
@@ -157,6 +198,8 @@ export type ImportHistoryResult = {
   count: number;
   message: string;
   detail?: string;
+  code?: "full_disk_access_required" | "history_import_failed" | "preview_only" | "whatsapp_setup_required";
+  needsFullDiskAccess?: boolean;
 };
 
 export type AutopilotRunResult = {
@@ -175,6 +218,7 @@ export type PreparedAutopilotReply = {
   status: "ready" | "idle" | "waiting" | "held" | "blocked" | "needs_input";
   message: string;
   contact?: Contact;
+  preparedContactKey?: string;
   inboundHash?: string;
   inboundText?: string;
   waitSeconds?: number;
@@ -194,6 +238,7 @@ export type PrepareAutopilotReplyRequest = {
 
 export type PreparedAutopilotSendRequest = {
   contact: Contact;
+  preparedContactKey: string;
   inboundHash: string;
   text: string;
   textParts?: string[];
@@ -226,6 +271,10 @@ export type SocializeAIAPI = {
   sendMessage: (request: SendMessageRequest) => Promise<SendMessageResult>;
   listIMessageChats: () => Promise<IMessageChat[]>;
   importIMessageHistory: (request: ImportHistoryRequest) => Promise<ImportHistoryResult>;
+  getWhatsAppBridgeStatus: (settings?: AppSettings) => Promise<WhatsAppBridgeStatus>;
+  startWhatsAppBridge: (settings?: AppSettings) => Promise<WhatsAppBridgeStatus>;
+  listWhatsAppChats: () => Promise<WhatsAppChat[]>;
+  importWhatsAppHistory: (request: ImportHistoryRequest) => Promise<ImportHistoryResult>;
   runAutopilotOnce: () => Promise<AutopilotRunResult>;
   prepareAutopilotReply: (request: PrepareAutopilotReplyRequest) => Promise<PreparedAutopilotReply>;
   sendPreparedAutopilotReply: (request: PreparedAutopilotSendRequest) => Promise<SendMessageResult>;
@@ -244,18 +293,25 @@ export const defaultSettings: AppSettings = {
   localModel: "qwen3:8b",
   localOpenAiBaseUrl: "http://127.0.0.1:1234",
   localOpenAiModel: "qwen3.7",
+  globalUserContext: "",
   iMessageDryRun: true,
   whatsappDryRun: true,
+  whatsappProvider: "personal_bridge",
+  whatsappBridgeUrl: "http://127.0.0.1:8080/api",
+  whatsappBridgeToken: "",
+  whatsappMessagesDbPath: "",
   whatsappAccessToken: "",
   whatsappPhoneNumberId: "",
   whatsappGraphVersion: "v25.0",
+  permissionMode: "safe",
   requireHumanApproval: true,
   autopilotEnabled: false,
   autopilotIntervalMinutes: 10,
   maxAutoSendsPerRun: 3,
   appendDisclosure: false,
   disclosureText: "Sent with AI assistance.",
-  privacyBlurEnabled: false
+  privacyBlurEnabled: false,
+  darkModeEnabled: true
 };
 
 export const suggestedOpenAiModels = ["gpt-5.5", "gpt-5.1", "gpt-4.1", "gpt-4o"];
