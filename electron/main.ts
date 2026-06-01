@@ -1139,7 +1139,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
     });
     const preparedText = appendDisclosureToText(state.settings, draft.draftText);
 
-    if (!canAutoSendDraft(state, inbound, draft)) {
+    if (!forceReply && !canAutoSendDraft(state, inbound, draft)) {
       contact.lastAutopilotInboundHash = inboundHash;
       contact.lastAutopilotAt = nowIso();
       state.audits = [
