@@ -182,6 +182,7 @@ function App() {
   const pendingSendInFlight = useRef(false);
 
   const openFullDiskAccessSettings = () => window.socializeAI.openFullDiskAccessSettings();
+  const updateSettingsDraft = (patch: Partial<AppSettings>) => setSettingsDraft((current) => ({ ...current, ...patch }));
 
   useEffect(() => {
     window.socializeAI
@@ -258,10 +259,10 @@ function App() {
     }
   }
 
-  async function persist(next: AppState, message?: string) {
+  async function persist(next: AppState, message?: string, syncSettingsDraft = true) {
     const saved = await window.socializeAI.saveState(next);
     setState(saved);
-    setSettingsDraft(saved.settings);
+    if (syncSettingsDraft) setSettingsDraft(saved.settings);
     if (message) setNotice(message);
     return saved;
   }
@@ -369,7 +370,6 @@ function App() {
       const result: PreparedAutopilotReply = await window.socializeAI.prepareAutopilotReply({ contact, regenerate });
       const saved = await window.socializeAI.getState();
       setState(saved);
-      setSettingsDraft(saved.settings);
 
       if (result.ok && result.status === "ready" && result.contact && result.inboundHash && result.draftText) {
         setPendingBotSend({
@@ -441,7 +441,6 @@ function App() {
       else setError(result.message);
       const saved = await window.socializeAI.getState();
       setState(saved);
-      setSettingsDraft(saved.settings);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -702,7 +701,8 @@ function App() {
           ...state.audits
         ].slice(0, 500)
       },
-      "Contact saved."
+      "Contact saved.",
+      false
     );
     setContactDraft(blankContact());
     setSelectedContactId(contact.id);
@@ -751,7 +751,7 @@ function App() {
   async function deleteContact(contactId: string) {
     if (!state) return;
     const contacts = state.contacts.filter((item) => item.id !== contactId);
-    await persist({ ...state, contacts }, "Contact deleted.");
+    await persist({ ...state, contacts }, "Contact deleted.", false);
     setSelectedContactId(contacts[0]?.id ?? "");
   }
 
@@ -860,7 +860,7 @@ function App() {
         {view === "settings" && (
           <SettingsPanel
             settings={settingsDraft}
-            setSettings={setSettingsDraft}
+            updateSettings={updateSettingsDraft}
             permissionReport={permissionReport}
             busy={busy}
             onSave={saveSettings}
@@ -886,6 +886,7 @@ function Onboarding(props: {
   onComplete: () => void;
   onOpenPermissions: () => void;
 }) {
+  const updateSettings = (patch: Partial<AppSettings>) => props.setSettings({ ...props.settings, ...patch });
   return (
     <div className="onboarding-shell">
       <section className="onboarding-card">
@@ -899,7 +900,7 @@ function Onboarding(props: {
           <h1>Set up your messaging brain.</h1>
           <p>Choose OpenAI or a local model. You can change this later in settings.</p>
         </div>
-        <ProviderSettings settings={props.settings} setSettings={props.setSettings} compact={false} />
+        <ProviderSettings settings={props.settings} updateSettings={updateSettings} compact={false} />
         <StatusBar error={props.error} notice={props.notice} />
         <div className="action-row">
           <button className="secondary-button" onClick={props.onOpenPermissions}>
@@ -1360,7 +1361,7 @@ function ContactsPanel(props: {
 
 function SettingsPanel(props: {
   settings: AppSettings;
-  setSettings: (settings: AppSettings) => void;
+  updateSettings: (patch: Partial<AppSettings>) => void;
   permissionReport: MacPermissionReport | null;
   busy: string | null;
   onSave: () => void;
@@ -1379,13 +1380,13 @@ function SettingsPanel(props: {
           </div>
           <KeyRound size={26} />
         </div>
-        <ProviderSettings settings={props.settings} setSettings={props.setSettings} compact />
+        <ProviderSettings settings={props.settings} updateSettings={props.updateSettings} compact />
         <div className="divider" />
         <div className="split-fields compact">
           <Toggle
             label="Blur private details"
             checked={props.settings.privacyBlurEnabled}
-            onChange={(checked) => props.setSettings({ ...props.settings, privacyBlurEnabled: checked })}
+            onChange={(checked) => props.updateSettings({ privacyBlurEnabled: checked })}
           />
           <div className="setting-note">
             Screen-share mode blurs names, handles, message text, and logs while keeping controls usable.
@@ -1396,24 +1397,24 @@ function SettingsPanel(props: {
           <Toggle
             label="iMessage dry run"
             checked={props.settings.iMessageDryRun}
-            onChange={(checked) => props.setSettings({ ...props.settings, iMessageDryRun: checked })}
+            onChange={(checked) => props.updateSettings({ iMessageDryRun: checked })}
           />
           <Toggle
             label="WhatsApp dry run"
             checked={props.settings.whatsappDryRun}
-            onChange={(checked) => props.setSettings({ ...props.settings, whatsappDryRun: checked })}
+            onChange={(checked) => props.updateSettings({ whatsappDryRun: checked })}
           />
         </div>
         <div className="split-fields compact">
           <Toggle
             label="Require human approval"
             checked={props.settings.requireHumanApproval}
-            onChange={(checked) => props.setSettings({ ...props.settings, requireHumanApproval: checked })}
+            onChange={(checked) => props.updateSettings({ requireHumanApproval: checked })}
           />
           <Toggle
             label="Autopilot enabled"
             checked={props.settings.autopilotEnabled}
-            onChange={(checked) => props.setSettings({ ...props.settings, autopilotEnabled: checked })}
+            onChange={(checked) => props.updateSettings({ autopilotEnabled: checked })}
           />
         </div>
         <div className="split-fields compact">
@@ -1424,7 +1425,7 @@ function SettingsPanel(props: {
               min={2}
               max={240}
               value={props.settings.autopilotIntervalMinutes}
-              onChange={(event) => props.setSettings({ ...props.settings, autopilotIntervalMinutes: Number(event.target.value) })}
+              onChange={(event) => props.updateSettings({ autopilotIntervalMinutes: Number(event.target.value) })}
             />
           </label>
           <label className="field-block">
@@ -1434,7 +1435,7 @@ function SettingsPanel(props: {
               min={1}
               max={20}
               value={props.settings.maxAutoSendsPerRun}
-              onChange={(event) => props.setSettings({ ...props.settings, maxAutoSendsPerRun: Number(event.target.value) })}
+              onChange={(event) => props.updateSettings({ maxAutoSendsPerRun: Number(event.target.value) })}
             />
           </label>
         </div>
@@ -1442,7 +1443,7 @@ function SettingsPanel(props: {
           <Toggle
             label="Append disclosure"
             checked={props.settings.appendDisclosure}
-            onChange={(checked) => props.setSettings({ ...props.settings, appendDisclosure: checked })}
+            onChange={(checked) => props.updateSettings({ appendDisclosure: checked })}
           />
           <div className="setting-note">
             Autopilot only scans saved iMessage chats with per-chat autopilot enabled. Dry run keeps it from sending while you test.
@@ -1452,7 +1453,7 @@ function SettingsPanel(props: {
           <span>Disclosure text</span>
           <input
             value={props.settings.disclosureText}
-            onChange={(event) => props.setSettings({ ...props.settings, disclosureText: event.target.value })}
+            onChange={(event) => props.updateSettings({ disclosureText: event.target.value })}
           />
         </label>
         <div className="divider" />
@@ -1489,7 +1490,7 @@ function SettingsPanel(props: {
             <input
               type="password"
               value={props.settings.whatsappAccessToken}
-              onChange={(event) => props.setSettings({ ...props.settings, whatsappAccessToken: event.target.value })}
+              onChange={(event) => props.updateSettings({ whatsappAccessToken: event.target.value })}
               placeholder="Meta permanent or temporary access token"
             />
           </label>
@@ -1497,7 +1498,7 @@ function SettingsPanel(props: {
             <span>Phone number ID</span>
             <input
               value={props.settings.whatsappPhoneNumberId}
-              onChange={(event) => props.setSettings({ ...props.settings, whatsappPhoneNumberId: event.target.value })}
+              onChange={(event) => props.updateSettings({ whatsappPhoneNumberId: event.target.value })}
             />
           </label>
         </div>
@@ -1505,7 +1506,7 @@ function SettingsPanel(props: {
           <span>Graph API version</span>
           <input
             value={props.settings.whatsappGraphVersion}
-            onChange={(event) => props.setSettings({ ...props.settings, whatsappGraphVersion: event.target.value })}
+            onChange={(event) => props.updateSettings({ whatsappGraphVersion: event.target.value })}
           />
         </label>
         <div className="action-row">
@@ -1527,9 +1528,9 @@ function SettingsPanel(props: {
   );
 }
 
-function ProviderSettings(props: { settings: AppSettings; setSettings: (settings: AppSettings) => void; compact: boolean }) {
+function ProviderSettings(props: { settings: AppSettings; updateSettings: (patch: Partial<AppSettings>) => void; compact: boolean }) {
   const settings = props.settings;
-  const setProvider = (provider: AiProvider) => props.setSettings({ ...settings, aiProvider: provider });
+  const setProvider = (provider: AiProvider) => props.updateSettings({ aiProvider: provider });
   return (
     <div className={props.compact ? "provider-settings compact-provider" : "provider-settings"}>
       <div className="segmented">
@@ -1551,7 +1552,7 @@ function ProviderSettings(props: { settings: AppSettings; setSettings: (settings
             <input
               type="password"
               value={settings.openAiApiKey}
-              onChange={(event) => props.setSettings({ ...settings, openAiApiKey: event.target.value })}
+              onChange={(event) => props.updateSettings({ openAiApiKey: event.target.value })}
               placeholder="sk-..."
             />
           </label>
@@ -1560,7 +1561,7 @@ function ProviderSettings(props: { settings: AppSettings; setSettings: (settings
             <input
               list="openai-models"
               value={settings.openAiModel}
-              onChange={(event) => props.setSettings({ ...settings, openAiModel: event.target.value })}
+              onChange={(event) => props.updateSettings({ openAiModel: event.target.value })}
             />
             <datalist id="openai-models">
               {suggestedOpenAiModels.map((model) => (
@@ -1575,11 +1576,11 @@ function ProviderSettings(props: { settings: AppSettings; setSettings: (settings
         <>
           <label className="field-block">
             <span>Ollama base URL</span>
-            <input value={settings.localBaseUrl} onChange={(event) => props.setSettings({ ...settings, localBaseUrl: event.target.value })} />
+            <input value={settings.localBaseUrl} onChange={(event) => props.updateSettings({ localBaseUrl: event.target.value })} />
           </label>
           <label className="field-block">
             <span>Local model</span>
-            <input list="local-models" value={settings.localModel} onChange={(event) => props.setSettings({ ...settings, localModel: event.target.value })} />
+            <input list="local-models" value={settings.localModel} onChange={(event) => props.updateSettings({ localModel: event.target.value })} />
           </label>
         </>
       )}
@@ -1590,7 +1591,7 @@ function ProviderSettings(props: { settings: AppSettings; setSettings: (settings
             <span>OpenAI-compatible base URL</span>
             <input
               value={settings.localOpenAiBaseUrl}
-              onChange={(event) => props.setSettings({ ...settings, localOpenAiBaseUrl: event.target.value })}
+              onChange={(event) => props.updateSettings({ localOpenAiBaseUrl: event.target.value })}
             />
           </label>
           <label className="field-block">
@@ -1598,7 +1599,7 @@ function ProviderSettings(props: { settings: AppSettings; setSettings: (settings
             <input
               list="local-models"
               value={settings.localOpenAiModel}
-              onChange={(event) => props.setSettings({ ...settings, localOpenAiModel: event.target.value })}
+              onChange={(event) => props.updateSettings({ localOpenAiModel: event.target.value })}
             />
           </label>
         </>
