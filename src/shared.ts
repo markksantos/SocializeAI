@@ -82,6 +82,7 @@ export type DraftRequest = {
 
 export type DraftResult = {
   draftText: string;
+  messageParts: string[];
   confidence: number;
   riskLevel: RiskLevel;
   requiresHumanReview: boolean;
@@ -171,12 +172,13 @@ export type AutopilotRunResult = {
 
 export type PreparedAutopilotReply = {
   ok: boolean;
-  status: "ready" | "idle" | "held" | "blocked";
+  status: "ready" | "idle" | "held" | "blocked" | "needs_input";
   message: string;
   contact?: Contact;
   inboundHash?: string;
   inboundText?: string;
   draftText?: string;
+  messageParts?: string[];
   draft?: DraftResult;
   details: string[];
 };
@@ -185,12 +187,14 @@ export type PrepareAutopilotReplyRequest = {
   contact: Contact;
   regenerate?: boolean;
   forceReply?: boolean;
+  userInstruction?: string;
 };
 
 export type PreparedAutopilotSendRequest = {
   contact: Contact;
   inboundHash: string;
   text: string;
+  textParts?: string[];
 };
 
 export type PreparedAutopilotCancelRequest = {

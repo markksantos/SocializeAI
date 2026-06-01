@@ -983,6 +983,7 @@ select:focus {
   margin-top: 6px;
   color: var(--ink);
   line-height: 1.38;
+  white-space: pre-wrap;
 }
 
 .pending-actions {

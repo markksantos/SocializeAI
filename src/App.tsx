@@ -42,6 +42,7 @@ type PendingBotSend = {
   contact: Contact;
   inboundHash: string;
   text: string;
+  textParts: string[];
   draft?: DraftResult;
   secondsLeft: number;
 };
@@ -96,6 +97,10 @@ function appendDisclosureToText(settings: AppSettings, rawText: string) {
   const disclosure = settings.appendDisclosure ? settings.disclosureText.trim() : "";
   if (!disclosure || text.endsWith(disclosure)) return text;
   return `${text}\n\n${disclosure}`;
+}
+
+function draftTextForDisplay(settings: AppSettings, draft: DraftResult) {
+  return appendDisclosureToText(settings, (draft.messageParts?.length ? draft.messageParts : [draft.draftText]).join("\n\n"));
 }
 
 function audit(type: AuditEvent["type"], summary: string, detail?: string): AuditEvent {
@@ -317,7 +322,7 @@ function App() {
     if (mode === "manual") setBusy("bot-check");
     try {
       if (regenerate) setPendingBotSend(null);
-      const result: PreparedAutopilotReply = await window.socializeAI.prepareAutopilotReply({ contact, regenerate, forceReply });
+      const result: PreparedAutopilotReply = await window.socializeAI.prepareAutopilotReply({ contact, regenerate, forceReply, userInstruction });
       const saved = await window.socializeAI.getState();
       setState(saved);
 
@@ -326,6 +331,7 @@ function App() {
           contact: result.contact,
           inboundHash: result.inboundHash,
           text: result.draftText,
+          textParts: result.messageParts?.length ? result.messageParts : [result.draftText],
           draft: result.draft,
           secondsLeft: 10
         });
@@ -334,7 +340,7 @@ function App() {
         return;
       }
 
-      if (result.status === "held" || result.status === "blocked") {
+      if (result.status === "held" || result.status === "blocked" || result.status === "needs_input") {
         const detail = result.details.filter(Boolean).join(" ");
         setError(detail ? `${result.message} ${detail}` : result.message);
       } else if (mode === "manual") {
@@ -358,7 +364,8 @@ function App() {
       const result = await window.socializeAI.sendPreparedAutopilotReply({
         contact: pendingBotSend.contact,
         inboundHash: pendingBotSend.inboundHash,
-        text: pendingBotSend.text
+        text: pendingBotSend.text,
+        textParts: pendingBotSend.textParts
       });
       const contactName = pendingBotSend.contact.displayName || "this chat";
       setPendingBotSend(null);
@@ -574,7 +581,7 @@ function App() {
         userInstruction
       });
       setDraft(result);
-      setFinalText(appendDisclosureToText(settingsDraft, result.draftText));
+      setFinalText(draftTextForDisplay(settingsDraft, result));
       setNotice("Draft generated.");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -1145,8 +1152,15 @@ function Workbench(props: {
           <div className="pending-send-card">
             <div>
               <span className="eyebrow">Bot is about to send</span>
-              <strong>Sending in {props.pendingBotSend.secondsLeft}s</strong>
-              <p className="private-text">{props.pendingBotSend.text}</p>
+              <strong>
+                Sending {props.pendingBotSend.textParts.length > 1 ? `${props.pendingBotSend.textParts.length} messages` : "message"} in{" "}
+                {props.pendingBotSend.secondsLeft}s
+              </strong>
+              {props.pendingBotSend.textParts.map((part, index) => (
+                <p className="private-text" key={`${index}-${part.slice(0, 24)}`}>
+                  {part}
+                </p>
+              ))}
             </div>
             <div className="pending-actions">
               <button className="secondary-button" onClick={props.onCancelPending} disabled={props.busy === "bot-cancel" || props.busy === "bot-send"}>

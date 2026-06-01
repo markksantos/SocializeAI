@@ -83,6 +83,7 @@ type AppState = {
 
 type DraftResult = {
   draftText: string;
+  messageParts: string[];
   confidence: number;
   riskLevel: RiskLevel;
   requiresHumanReview: boolean;
@@ -254,6 +255,7 @@ const draftSchema = {
   additionalProperties: false,
   required: [
     "draft_text",
+    "message_parts",
     "confidence",
     "risk_level",
     "requires_human_review",
@@ -263,6 +265,12 @@ const draftSchema = {
   ],
   properties: {
     draft_text: { type: "string" },
+    message_parts: {
+      type: "array",
+      minItems: 1,
+      maxItems: 4,
+      items: { type: "string" }
+    },
     confidence: { type: "number", minimum: 0, maximum: 1 },
     risk_level: { type: "string", enum: ["low", "medium", "high", "blocked"] },
     requires_human_review: { type: "boolean" },
@@ -316,6 +324,10 @@ function buildSystemPrompt() {
   return [
     "You draft personal text replies on behalf of the app user.",
     "Match the user's relationship-specific tone without inventing facts, plans, feelings, locations, money commitments, or promises.",
+    "Use message_parts for separate outgoing text bubbles. Use 1 part for a normal reply, or 2-4 short parts when double/triple texting would sound more natural.",
+    "draft_text must equal message_parts joined with a blank line between parts.",
+    "If the other person sent multiple consecutive messages, reply to the full cluster, not only the last line.",
+    "If the reply needs a personal fact that is not in the conversation, relationship memory, contact notes, or user instruction, do not guess and do not use placeholders. Return draft_text as NEEDS_USER_INPUT: followed by the missing fact.",
     "If context is ambiguous or sensitive, require human review.",
     "Never claim the user did something they did not say they did.",
     "Return only JSON matching the requested schema."
@@ -343,7 +355,8 @@ function buildDraftPrompt(input: {
     "Latest inbound message to reply to:",
     input.currentMessage || "No latest inbound message provided.",
     "",
-    "Draft a concise reply in the user's voice. Include memory_updates only for durable facts or style observations worth saving."
+    "Draft a concise reply in the user's voice. Include memory_updates only for durable facts or style observations worth saving.",
+    "Use separate message_parts when the user's style or the conversation cadence would make short double/triple texts feel more natural."
   ].join("\n");
 }
 
@@ -370,6 +383,24 @@ function extractJsonText(value: unknown): string {
   return "";
 }
 
+function splitOutgoingText(rawText: string) {
+  return rawText
+    .split(/\n{2,}/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .slice(0, 4);
+}
+
+function normalizeMessageParts(value: unknown, fallbackText: string) {
+  const rawParts = Array.isArray(value) ? value.map((part) => String(part).trim()).filter(Boolean) : [];
+  const parts = rawParts.length > 0 ? rawParts : splitOutgoingText(fallbackText);
+  return (parts.length > 0 ? parts : [fallbackText.trim()]).filter(Boolean).slice(0, 4);
+}
+
+function joinMessageParts(parts: string[]) {
+  return parts.map((part) => part.trim()).filter(Boolean).join("\n\n");
+}
+
 function parseDraft(raw: string, provider: AiProvider | "heuristic", model: string): DraftResult {
   let parsed: Record<string, unknown>;
   try {
@@ -380,8 +411,12 @@ function parseDraft(raw: string, provider: AiProvider | "heuristic", model: stri
     parsed = JSON.parse(match[0]);
   }
 
+  const parsedText = String(parsed.draft_text ?? parsed.draftText ?? "").trim();
+  const messageParts = normalizeMessageParts(parsed.message_parts ?? parsed.messageParts, parsedText);
+  const draftText = parsedText || joinMessageParts(messageParts);
   const result: DraftResult = {
-    draftText: String(parsed.draft_text ?? parsed.draftText ?? "").trim(),
+    draftText,
+    messageParts,
     confidence: clampNumber(Number(parsed.confidence ?? 0.5), 0, 1),
     riskLevel: normalizeRisk(parsed.risk_level),
     requiresHumanReview: Boolean(parsed.requires_human_review ?? true),
@@ -393,7 +428,7 @@ function parseDraft(raw: string, provider: AiProvider | "heuristic", model: stri
     raw
   };
 
-  if (!result.draftText) throw new Error("The model returned an empty draft.");
+  if (!result.draftText || result.messageParts.length === 0) throw new Error("The model returned an empty draft.");
   return applySafetyOverlay(result, `${result.draftText}\n${raw}`);
 }
 
@@ -541,7 +576,7 @@ async function generateDraftWithOllama(settings: AppSettings, request: unknown) 
         { role: "system", content: buildSystemPrompt() },
         {
           role: "user",
-          content: `${buildDraftPrompt(input)}\n\nReturn JSON with keys: draft_text, confidence, risk_level, requires_human_review, reason_codes, send_eligibility, memory_updates.`
+          content: `${buildDraftPrompt(input)}\n\nReturn JSON with keys: draft_text, message_parts, confidence, risk_level, requires_human_review, reason_codes, send_eligibility, memory_updates.`
         }
       ]
     })
@@ -573,7 +608,7 @@ async function generateDraftWithLocalOpenAI(settings: AppSettings, request: unkn
         { role: "system", content: buildSystemPrompt() },
         {
           role: "user",
-          content: `${buildDraftPrompt(input)}\n\nReturn JSON with keys: draft_text, confidence, risk_level, requires_human_review, reason_codes, send_eligibility, memory_updates.`
+          content: `${buildDraftPrompt(input)}\n\nReturn JSON with keys: draft_text, message_parts, confidence, risk_level, requires_human_review, reason_codes, send_eligibility, memory_updates.`
         }
       ]
     })
@@ -1020,15 +1055,34 @@ function hashText(value: string) {
 }
 
 function appendDisclosureToText(settings: AppSettings, rawText: string) {
-  const text = rawText.trim();
-  if (!text) throw new Error("Message is empty.");
-  const disclosure = settings.appendDisclosure ? settings.disclosureText.trim() : "";
-  if (!disclosure || text.endsWith(disclosure)) return text;
-  return `${text}\n\n${disclosure}`;
+  return joinMessageParts(appendDisclosureToParts(settings, splitOutgoingText(rawText)));
 }
 
-async function dispatchApprovedMessage(state: AppState, contact: Contact, rawText: string, dryRunOverride?: boolean) {
-  const text = appendDisclosureToText(state.settings, rawText);
+function appendDisclosureToParts(settings: AppSettings, rawParts: string[]) {
+  const parts = rawParts.map((part) => part.trim()).filter(Boolean).slice(0, 4);
+  if (parts.length === 0) throw new Error("Message is empty.");
+  const disclosure = settings.appendDisclosure ? settings.disclosureText.trim() : "";
+  if (!disclosure) return parts;
+  const last = parts[parts.length - 1];
+  if (last === disclosure && parts.length > 1) {
+    return [...parts.slice(0, -2), `${parts[parts.length - 2]}\n\n${disclosure}`];
+  }
+  if (last.endsWith(disclosure)) return parts;
+  return [...parts.slice(0, -1), `${last}\n\n${disclosure}`];
+}
+
+function outgoingPartsFromTextOrParts(settings: AppSettings, rawText: string, rawParts?: string[]) {
+  const parts = rawParts?.length ? rawParts : splitOutgoingText(rawText);
+  return appendDisclosureToParts(settings, parts);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function dispatchApprovedMessage(state: AppState, contact: Contact, rawText: string, dryRunOverride?: boolean, rawParts?: string[]) {
+  const parts = outgoingPartsFromTextOrParts(state.settings, rawText, rawParts);
+  const text = joinMessageParts(parts);
 
   const dryRun =
     typeof dryRunOverride === "boolean"
@@ -1049,17 +1103,26 @@ async function dispatchApprovedMessage(state: AppState, contact: Contact, rawTex
 
   if (contact.platform === "imessage") {
     if (!contact.handle.trim()) throw new Error("This iMessage contact needs a phone number or Apple ID handle.");
-    const detail = await sendIMessage(contact.handle, text, contact.chatGuid);
+    const details: string[] = [];
+    for (const [index, part] of parts.entries()) {
+      const detail = await sendIMessage(contact.handle, part, contact.chatGuid);
+      if (detail) details.push(detail);
+      if (index < parts.length - 1) await sleep(900);
+    }
     return {
       ok: true,
       dryRun: false,
       message: "iMessage send command completed.",
-      detail: detail || text
+      detail: details.join("\n") || text
     };
   }
 
   if (contact.platform === "whatsapp") {
-    const receiptId = await sendWhatsApp(state.settings, contact.handle, text);
+    let receiptId: string | undefined;
+    for (const [index, part] of parts.entries()) {
+      receiptId = await sendWhatsApp(state.settings, contact.handle, part);
+      if (index < parts.length - 1) await sleep(900);
+    }
     return {
       ok: true,
       dryRun: false,
@@ -1100,11 +1163,52 @@ function canAutoSendDraft(state: AppState, inbound: string, draft: { riskLevel: 
   );
 }
 
-async function prepareAutopilotReply(request: Contact | { contact: Contact; regenerate?: boolean; forceReply?: boolean }) {
+function parseTranscriptTimestamp(line: string) {
+  const match = line.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/);
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second] = match;
+  return new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second));
+}
+
+function secondsUntilInboundSettles(inbound: string, waitSeconds = 45) {
+  const sentAt = parseTranscriptTimestamp(inbound);
+  if (!sentAt) return 0;
+  const elapsed = (Date.now() - sentAt.getTime()) / 1000;
+  if (elapsed < -5 || elapsed >= waitSeconds) return 0;
+  return Math.ceil(waitSeconds - Math.max(0, elapsed));
+}
+
+function detectUserInputNeed(inbound: string, draft: DraftResult, availableContext: string, userInstruction: string) {
+  const draftText = `${draft.draftText}\n${draft.messageParts.join("\n")}`;
+  const reasons: string[] = [];
+  if (/NEEDS_USER_INPUT\s*:/i.test(draftText)) {
+    reasons.push(draftText.replace(/^.*?NEEDS_USER_INPUT\s*:\s*/is, "").trim() || "The reply needs information from you.");
+  }
+  if (/\[[^\]]*(?:link|url|site|website|github|email|phone|insert|placeholder)[^\]]*\]/i.test(draftText)) {
+    reasons.push("The draft contains placeholder text instead of a real answer.");
+  }
+  if (/\b(?:site|website|github|portfolio|email|phone|linkedin|instagram)\s+link\b/i.test(draftText)) {
+    reasons.push("The draft contains a generic link label instead of a real answer.");
+  }
+
+  const asksForPersonalReference =
+    /\b(?:what'?s|what is|send|share|drop|remind|again|link)\b[\s\S]{0,120}\b(?:website|site|github|portfolio|email|phone|number|address|linkedin|instagram)\b/i.test(inbound);
+  const knownReference = /(https?:\/\/|github\.com\/|[a-z0-9-]+\.(?:com|ai|io|co|net|org|dev|studio|app)\b|@[a-z0-9_.-]{3,})/i.test(
+    `${availableContext}\n${userInstruction}`
+  );
+  if (asksForPersonalReference && !knownReference && !userInstruction.trim()) {
+    reasons.push("They asked for a personal link or contact detail, and the app does not have that answer.");
+  }
+
+  return Array.from(new Set(reasons.filter(Boolean)));
+}
+
+async function prepareAutopilotReply(request: Contact | { contact: Contact; regenerate?: boolean; forceReply?: boolean; userInstruction?: string }) {
   const state = await readState();
   const contactRequest = "contact" in request ? request.contact : request;
   const regenerate = "contact" in request ? Boolean(request.regenerate) : false;
   const forceReply = "contact" in request ? Boolean(request.forceReply) : false;
+  const userSuppliedInstruction = "contact" in request ? String(request.userInstruction || "").trim() : "";
   const contact = findStoredContact(state, contactRequest) || contactRequest;
   const details: string[] = [];
   if (!contact.allowAutopilot) {
@@ -1123,6 +1227,17 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
     if (!inbound) {
       return { ok: false, status: "idle", message: "No inbound iMessage found.", contact, details };
     }
+    const waitSeconds = !regenerate && !userSuppliedInstruction ? secondsUntilInboundSettles(inbound) : 0;
+    if (waitSeconds > 0) {
+      return {
+        ok: false,
+        status: "idle",
+        message: `Waiting ${waitSeconds}s to see if they keep texting before replying.`,
+        contact,
+        inboundText: inbound,
+        details: [`Latest inbound message is still fresh. Waiting avoids replying before a double/triple text finishes.`]
+      };
+    }
     const inboundHash = hashText(inbound);
     if (!forceReply && contact.lastAutopilotInboundHash === inboundHash) {
       return { ok: false, status: "idle", message: "Latest inbound message already handled.", contact, inboundHash, inboundText: inbound, details };
@@ -1133,11 +1248,40 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
       currentMessage: inbound,
       conversationContext: imported.messages,
       relationshipMemory: contact.notes,
-      userInstruction: regenerate
-        ? "Autopilot mode. Regenerate a different concise, natural reply in the user's voice. Avoid repeating the previous wording. Only set can_auto_send true and requires_human_review false for simple low-risk acknowledgements, casual replies, or scheduling."
-        : "Autopilot mode. Produce a concise, natural reply in the user's voice. Only set can_auto_send true and requires_human_review false for simple low-risk acknowledgements, casual replies, or scheduling."
+      userInstruction: [
+        regenerate
+          ? "Autopilot mode. Regenerate a different concise, natural reply in the user's voice. Avoid repeating the previous wording. Only set can_auto_send true and requires_human_review false for simple low-risk acknowledgements, casual replies, or scheduling."
+          : "Autopilot mode. Produce a concise, natural reply in the user's voice. Only set can_auto_send true and requires_human_review false for simple low-risk acknowledgements, casual replies, or scheduling.",
+        userSuppliedInstruction ? `User-provided answer/instruction: ${userSuppliedInstruction}` : ""
+      ]
+        .filter(Boolean)
+        .join("\n")
     });
-    const preparedText = appendDisclosureToText(state.settings, draft.draftText);
+    const userInputReasons = detectUserInputNeed(inbound, draft, `${imported.messages}\n${contact.notes}`, userSuppliedInstruction);
+    if (userInputReasons.length > 0) {
+      contact.lastAutopilotInboundHash = inboundHash;
+      contact.lastAutopilotAt = nowIso();
+      state.audits = [
+        createAudit("message_blocked", `Bot needs input for ${contact.displayName}`, userInputReasons.join(" ")),
+        ...state.audits
+      ].slice(0, 500);
+      await writeState(state);
+      return {
+        ok: false,
+        status: "needs_input",
+        message: "I need your answer before replying.",
+        contact,
+        inboundHash,
+        inboundText: inbound,
+        draftText: draft.draftText,
+        messageParts: draft.messageParts,
+        draft,
+        details: [...userInputReasons, "Add the answer in Optional instruction for the next reply, then press Start bot again."]
+      };
+    }
+
+    const preparedParts = appendDisclosureToParts(state.settings, draft.messageParts);
+    const preparedText = joinMessageParts(preparedParts);
 
     if (!forceReply && !canAutoSendDraft(state, inbound, draft)) {
       contact.lastAutopilotInboundHash = inboundHash;
@@ -1155,6 +1299,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
         inboundHash,
         inboundText: inbound,
         draftText: preparedText,
+        messageParts: preparedParts,
         draft,
         details: [draft.sendEligibility.explanation]
       };
@@ -1177,6 +1322,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
       inboundHash,
       inboundText: inbound,
       draftText: preparedText,
+      messageParts: preparedParts,
       draft,
       details
     };
@@ -1188,11 +1334,11 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
   }
 }
 
-async function sendPreparedAutopilotReply(request: { contact: Contact; inboundHash: string; text: string }) {
+async function sendPreparedAutopilotReply(request: { contact: Contact; inboundHash: string; text: string; textParts?: string[] }) {
   const state = await readState();
   const contact = findStoredContact(state, request.contact) || request.contact;
   try {
-    const result = await dispatchApprovedMessage(state, contact, request.text);
+    const result = await dispatchApprovedMessage(state, contact, request.text, undefined, request.textParts);
     if (result.ok) {
       const stored = findStoredContact(state, contact);
       if (stored) {
@@ -1257,6 +1403,12 @@ async function runAutopilotOnce(source: "manual" | "timer") {
         details.push(`${contact.displayName}: no inbound iMessage found.`);
         continue;
       }
+      const waitSeconds = secondsUntilInboundSettles(inbound);
+      if (waitSeconds > 0) {
+        skipped += 1;
+        details.push(`${contact.displayName}: waiting ${waitSeconds}s to see if they keep texting.`);
+        continue;
+      }
       const inboundHash = hashText(inbound);
       if (contact.lastAutopilotInboundHash === inboundHash) {
         const lastFailure = contact.lastAutopilotAt
@@ -1264,6 +1416,7 @@ async function runAutopilotOnce(source: "manual" | "timer") {
               (event) =>
                 event.type === "message_blocked" &&
                 event.summary.includes(contact.displayName) &&
+                /send failed/i.test(event.summary) &&
                 event.at >= contact.lastAutopilotAt!
             )
           : false;
@@ -1286,6 +1439,19 @@ async function runAutopilotOnce(source: "manual" | "timer") {
       });
       drafted += 1;
 
+      const userInputReasons = detectUserInputNeed(inbound, draft, `${imported.messages}\n${contact.notes}`, "");
+      if (userInputReasons.length > 0) {
+        contact.lastAutopilotInboundHash = inboundHash;
+        contact.lastAutopilotAt = nowIso();
+        skipped += 1;
+        details.push(`${contact.displayName}: needs your input before replying.`);
+        state.audits = [
+          createAudit("message_blocked", `Autopilot needs input for ${contact.displayName}`, userInputReasons.join(" ")),
+          ...state.audits
+        ].slice(0, 500);
+        continue;
+      }
+
       const canAutoSend =
         draft.riskLevel === "low" &&
         !draft.requiresHumanReview &&
@@ -1305,7 +1471,7 @@ async function runAutopilotOnce(source: "manual" | "timer") {
         continue;
       }
 
-      const result = await dispatchApprovedMessage(state, contact, draft.draftText);
+      const result = await dispatchApprovedMessage(state, contact, draft.draftText, undefined, draft.messageParts);
       if (result.dryRun) dryRuns += 1;
       else sent += 1;
       contact.lastAutopilotInboundHash = inboundHash;
@@ -1551,7 +1717,7 @@ ipcMain.handle("message:send", async (_event, request: { contact: Contact; text:
   const state = await readState();
   const contact = request.contact;
   if (!contact) throw new Error("Choose a contact and write a message first.");
-  const text = appendDisclosureToText(state.settings, request.text);
+  const text = joinMessageParts(outgoingPartsFromTextOrParts(state.settings, request.text));
   if (contact.optedOut) {
     state.audits = [createAudit("message_blocked", `Blocked send to ${contact.displayName}`, "Contact is opted out."), ...state.audits].slice(0, 500);
     await writeState(state);
@@ -1565,7 +1731,7 @@ ipcMain.handle("message:send", async (_event, request: { contact: Contact; text:
   }
 
   try {
-    const result = await dispatchApprovedMessage(state, contact, text, request.dryRunOverride);
+    const result = await dispatchApprovedMessage(state, contact, request.text, request.dryRunOverride);
     state.audits = [
       createAudit(
         result.dryRun ? "message_dry_run" : "message_sent",
@@ -1615,11 +1781,13 @@ ipcMain.handle("imessage:import-history", async (_event, request: { handle: stri
 
 ipcMain.handle("autopilot:run-once", async () => runAutopilotOnce("manual"));
 
-ipcMain.handle("autopilot:prepare-reply", async (_event, request: Contact | { contact: Contact; regenerate?: boolean; forceReply?: boolean }) =>
+ipcMain.handle("autopilot:prepare-reply", async (_event, request: Contact | { contact: Contact; regenerate?: boolean; forceReply?: boolean; userInstruction?: string }) =>
   prepareAutopilotReply(request)
 );
 
-ipcMain.handle("autopilot:send-prepared", async (_event, request: { contact: Contact; inboundHash: string; text: string }) => sendPreparedAutopilotReply(request));
+ipcMain.handle("autopilot:send-prepared", async (_event, request: { contact: Contact; inboundHash: string; text: string; textParts?: string[] }) =>
+  sendPreparedAutopilotReply(request)
+);
 
 ipcMain.handle("autopilot:cancel-prepared", async (_event, request: { contact: Contact; inboundHash: string; reason?: string }) => cancelPreparedAutopilotReply(request));
 

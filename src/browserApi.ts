@@ -85,6 +85,7 @@ function previewDraft(request: DraftRequest, settings: AppSettings): DraftResult
       : "Hey, just seeing this now. I will reply properly in a bit.";
   return {
     draftText,
+    messageParts: [draftText],
     confidence: 0.62,
     riskLevel: risky ? "high" : "low",
     requiresHumanReview: true,
@@ -192,6 +193,7 @@ export function installBrowserApiFallback() {
         inboundHash: crypto.randomUUID(),
         inboundText: "Preview inbound message",
         draftText: appendDisclosureToText(state.settings, draft.draftText),
+        messageParts: [appendDisclosureToText(state.settings, draft.draftText)],
         draft,
         details: []
       };
