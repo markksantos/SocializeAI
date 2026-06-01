@@ -327,7 +327,7 @@ function buildSystemPrompt() {
     "Use message_parts for separate outgoing text bubbles. Use 1 part for a normal reply, or 2-4 short parts when double/triple texting would sound more natural.",
     "draft_text must equal message_parts joined with a blank line between parts.",
     "If the other person sent multiple consecutive messages, reply to the full cluster, not only the last line.",
-    "If the reply needs a personal fact that is not in the conversation, relationship memory, contact notes, or user instruction, do not guess and do not use placeholders. Return draft_text as NEEDS_USER_INPUT: followed by the missing fact.",
+    "If the reply needs a personal fact that is not in the conversation, relationship memory, contact notes, or user instruction, do not guess and do not use placeholders. This includes website, GitHub, Discord, Telegram, email, phone, social handles, or contact details. Return draft_text as NEEDS_USER_INPUT: followed by the missing fact.",
     "If context is ambiguous or sensitive, require human review.",
     "Never claim the user did something they did not say they did.",
     "Return only JSON matching the requested schema."
@@ -1181,23 +1181,27 @@ function secondsUntilInboundSettles(inbound: string, waitSeconds = 45) {
 function detectUserInputNeed(inbound: string, draft: DraftResult, availableContext: string, userInstruction: string) {
   const draftText = `${draft.draftText}\n${draft.messageParts.join("\n")}`;
   const reasons: string[] = [];
-  if (/NEEDS_USER_INPUT\s*:/i.test(draftText)) {
-    reasons.push(draftText.replace(/^.*?NEEDS_USER_INPUT\s*:\s*/is, "").trim() || "The reply needs information from you.");
+  const needsUserInputReason = draftText
+    .split(/\n+/)
+    .map((line) => line.match(/NEEDS_USER_INPUT\s*:\s*(.+)/i)?.[1]?.trim())
+    .find(Boolean);
+  if (needsUserInputReason) {
+    reasons.push(needsUserInputReason);
   }
-  if (/\[[^\]]*(?:link|url|site|website|github|email|phone|insert|placeholder)[^\]]*\]/i.test(draftText)) {
+  if (/\[[^\]]*(?:link|url|site|website|github|discord|telegram|email|phone|handle|insert|placeholder)[^\]]*\]/i.test(draftText)) {
     reasons.push("The draft contains placeholder text instead of a real answer.");
   }
-  if (/\b(?:site|website|github|portfolio|email|phone|linkedin|instagram)\s+link\b/i.test(draftText)) {
+  if (/\b(?:site|website|github|portfolio|discord|telegram|email|phone|linkedin|instagram)\s+(?:link|handle)\b/i.test(draftText)) {
     reasons.push("The draft contains a generic link label instead of a real answer.");
   }
 
   const asksForPersonalReference =
-    /\b(?:what'?s|what is|send|share|drop|remind|again|link)\b[\s\S]{0,120}\b(?:website|site|github|portfolio|email|phone|number|address|linkedin|instagram)\b/i.test(inbound);
-  const knownReference = /(https?:\/\/|github\.com\/|[a-z0-9-]+\.(?:com|ai|io|co|net|org|dev|studio|app)\b|@[a-z0-9_.-]{3,})/i.test(
+    /\b(?:what'?s|what is|send|share|drop|remind|again|link|handle)\b[\s\S]{0,120}\b(?:website|site|github|portfolio|discord|telegram|email|phone|number|address|linkedin|instagram)\b/i.test(inbound);
+  const knownReference = /(https?:\/\/|github\.com\/|t\.me\/|telegram\.me\/|discord(?:\.gg|app\.com)\/|[a-z0-9-]+\.(?:com|ai|io|co|net|org|dev|studio|app)\b|@[a-z0-9_.-]{3,})/i.test(
     `${availableContext}\n${userInstruction}`
   );
   if (asksForPersonalReference && !knownReference && !userInstruction.trim()) {
-    reasons.push("They asked for a personal link or contact detail, and the app does not have that answer.");
+    reasons.push("They asked for a personal handle, link, or contact detail, and the app does not have that answer.");
   }
 
   return Array.from(new Set(reasons.filter(Boolean)));
@@ -1278,7 +1282,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
         draftText: draft.draftText,
         messageParts: draft.messageParts,
         draft,
-        details: [...userInputReasons, "Add the answer in Optional instruction for the next reply, then press Start bot again."]
+        details: userInputReasons
       };
     }
 

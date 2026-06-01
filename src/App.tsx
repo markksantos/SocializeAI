@@ -63,6 +63,13 @@ type HeldBotReview = {
   reason: string;
 };
 
+type NeedsInputPrompt = {
+  contact: Contact;
+  inboundHash?: string;
+  inboundText?: string;
+  question: string;
+};
+
 const blankContact = (): Contact => ({
   id: crypto.randomUUID(),
   displayName: "",
@@ -156,6 +163,8 @@ function App() {
   const [botWait, setBotWait] = useState<BotWait | null>(null);
   const [heldBotReview, setHeldBotReview] = useState<HeldBotReview | null>(null);
   const [heldReviewText, setHeldReviewText] = useState("");
+  const [needsInputPrompt, setNeedsInputPrompt] = useState<NeedsInputPrompt | null>(null);
+  const [needsInputAnswer, setNeedsInputAnswer] = useState("");
   const [permissionReport, setPermissionReport] = useState<MacPermissionReport | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string>("");
@@ -206,6 +215,8 @@ function App() {
     setBotWait(null);
     setHeldBotReview(null);
     setHeldReviewText("");
+    setNeedsInputPrompt(null);
+    setNeedsInputAnswer("");
     void loadThreadForContact(activeContact, false);
   }, [activeContact?.chatId]);
 
@@ -239,7 +250,7 @@ function App() {
       void refreshActiveThreadAndBot(false);
     }, 5000);
     return () => window.clearInterval(poll);
-  }, [state, activeContact?.chatId, pendingBotSend?.inboundHash, botWait?.contact.id, heldBotReview?.inboundHash]);
+  }, [state, activeContact?.chatId, pendingBotSend?.inboundHash, botWait?.contact.id, heldBotReview?.inboundHash, needsInputPrompt?.inboundHash]);
 
   async function refreshIMessageChats(showNotice = true) {
     setBusy("chats");
@@ -358,14 +369,28 @@ function App() {
     );
   }
 
-  async function prepareBotReplyForContact(contact: Contact, mode: "manual" | "poll" = "poll", regenerate = false, forceReply = false, skipWait = false) {
+  async function prepareBotReplyForContact(
+    contact: Contact,
+    mode: "manual" | "poll" = "poll",
+    regenerate = false,
+    forceReply = false,
+    skipWait = false,
+    instructionOverride?: string
+  ) {
     if (botCheckInFlight.current || (pendingBotSend && !regenerate)) return;
     botCheckInFlight.current = true;
     if (mode === "manual") setBusy("bot-check");
     try {
       if (regenerate) setPendingBotSend(null);
       if (skipWait) setBotWait(null);
-      const result: PreparedAutopilotReply = await window.socializeAI.prepareAutopilotReply({ contact, regenerate, forceReply, skipWait, userInstruction });
+      const replyInstruction = instructionOverride ?? userInstruction;
+      const result: PreparedAutopilotReply = await window.socializeAI.prepareAutopilotReply({
+        contact,
+        regenerate,
+        forceReply,
+        skipWait,
+        userInstruction: replyInstruction
+      });
       const saved = await window.socializeAI.getState();
       setState(saved);
 
@@ -373,6 +398,8 @@ function App() {
         setBotWait(null);
         setHeldBotReview(null);
         setHeldReviewText("");
+        setNeedsInputPrompt(null);
+        setNeedsInputAnswer("");
         setPendingBotSend({
           contact: result.contact,
           inboundHash: result.inboundHash,
@@ -381,6 +408,24 @@ function App() {
           draft: result.draft,
           secondsLeft: 10
         });
+        setNotice("");
+        setError("");
+        return;
+      }
+
+      if (result.status === "needs_input" && result.contact) {
+        const question = result.details.filter(Boolean).join(" ") || "The bot needs one detail from you before replying.";
+        setBotWait(null);
+        setPendingBotSend(null);
+        setHeldBotReview(null);
+        setHeldReviewText("");
+        setNeedsInputPrompt({
+          contact: result.contact,
+          inboundHash: result.inboundHash,
+          inboundText: result.inboundText,
+          question
+        });
+        setNeedsInputAnswer("");
         setNotice("");
         setError("");
         return;
@@ -401,6 +446,8 @@ function App() {
         const textParts = result.messageParts?.length ? result.messageParts : [result.draftText];
         setBotWait(null);
         setPendingBotSend(null);
+        setNeedsInputPrompt(null);
+        setNeedsInputAnswer("");
         setHeldBotReview({
           contact: result.contact,
           inboundHash: result.inboundHash,
@@ -415,7 +462,7 @@ function App() {
         return;
       }
 
-      if (result.status === "held" || result.status === "blocked" || result.status === "needs_input") {
+      if (result.status === "held" || result.status === "blocked") {
         const detail = result.details.filter(Boolean).join(" ");
         setError(detail ? `${result.message} ${detail}` : result.message);
       } else if (mode === "manual") {
@@ -549,10 +596,30 @@ function App() {
     }
   }
 
+  async function submitNeedsInputAnswer() {
+    if (!needsInputPrompt) return;
+    const answer = needsInputAnswer.trim();
+    if (!answer) {
+      setError("Type the missing answer first.");
+      return;
+    }
+    const contact = needsInputPrompt.contact;
+    setUserInstruction(answer);
+    setNeedsInputPrompt(null);
+    setNeedsInputAnswer("");
+    await prepareBotReplyForContact(contact, "manual", false, true, true, answer);
+  }
+
+  function dismissNeedsInputPrompt() {
+    setNeedsInputPrompt(null);
+    setNeedsInputAnswer("");
+    setNotice("Bot paused this reply until you provide the missing answer.");
+  }
+
   async function refreshActiveThreadAndBot(showNotice = false) {
     if (!state || !activeContact?.chatId) return;
     await loadThreadForContact(activeContact, showNotice, !showNotice);
-    if (botIsRunningForContact(state, activeContact) && !pendingBotSend && !botWait && !heldBotReview) {
+    if (botIsRunningForContact(state, activeContact) && !pendingBotSend && !botWait && !heldBotReview && !needsInputPrompt) {
       await prepareBotReplyForContact(activeContact, "poll");
     }
   }
@@ -930,6 +997,9 @@ function App() {
             heldBotReview={heldBotReview}
             heldReviewText={heldReviewText}
             setHeldReviewText={setHeldReviewText}
+            needsInputPrompt={needsInputPrompt}
+            needsInputAnswer={needsInputAnswer}
+            setNeedsInputAnswer={setNeedsInputAnswer}
             busy={busy}
             onSend={sendMessage}
             onImport={importHistory}
@@ -948,6 +1018,8 @@ function App() {
             onSkipWait={skipBotWait}
             onApproveHeldReview={approveHeldBotReview}
             onDenyHeldReview={denyHeldBotReview}
+            onSubmitNeedsInput={submitNeedsInputAnswer}
+            onDismissNeedsInput={dismissNeedsInputPrompt}
           />
         )}
         {view === "contacts" && (
@@ -1048,6 +1120,9 @@ function Workbench(props: {
   heldBotReview: HeldBotReview | null;
   heldReviewText: string;
   setHeldReviewText: (value: string) => void;
+  needsInputPrompt: NeedsInputPrompt | null;
+  needsInputAnswer: string;
+  setNeedsInputAnswer: (value: string) => void;
   busy: string | null;
   onSend: () => void;
   onImport: () => void;
@@ -1066,6 +1141,8 @@ function Workbench(props: {
   onSkipWait: () => void;
   onApproveHeldReview: () => void;
   onDenyHeldReview: () => void;
+  onSubmitNeedsInput: () => void;
+  onDismissNeedsInput: () => void;
 }) {
   const selected = props.selectedContact;
   const selectedChat = props.imessageChats.find((chat) => chat.chatId === props.selectedChatId) ?? props.imessageChats[0];
@@ -1342,6 +1419,41 @@ function Workbench(props: {
                 <Send size={16} />
                 Send now
               </button>
+            </div>
+          </div>
+        )}
+
+        {props.needsInputPrompt && (
+          <div className="held-review-backdrop" role="dialog" aria-modal="true">
+            <div className="held-review-modal needs-input-modal">
+              <div className="panel-title-row compact-title">
+                <div>
+                  <span className="eyebrow">Bot needs your answer</span>
+                  <h3 className="subheading">Add the missing detail</h3>
+                </div>
+              </div>
+              <p className="review-reason private-text">{props.needsInputPrompt.question}</p>
+              <label className="field-block">
+                <span>Your answer</span>
+                <textarea
+                  className="private-field"
+                  value={props.needsInputAnswer}
+                  onChange={(event) => props.setNeedsInputAnswer(event.target.value)}
+                  placeholder="Example: Share my Discord @mark..."
+                  rows={4}
+                  autoFocus
+                />
+              </label>
+              <div className="held-review-actions">
+                <button className="secondary-button" onClick={props.onDismissNeedsInput} disabled={props.busy === "bot-check" || props.busy === "bot-send"}>
+                  <X size={16} />
+                  Don't reply
+                </button>
+                <button className="primary-button" onClick={props.onSubmitNeedsInput} disabled={props.busy === "bot-check" || !props.needsInputAnswer.trim()}>
+                  <RefreshCw size={16} />
+                  Generate reply
+                </button>
+              </div>
             </div>
           </div>
         )}
