@@ -3,6 +3,7 @@ import type {
   AppState,
   DraftRequest,
   DraftResult,
+  IMessageChat,
   ImportHistoryRequest,
   SendMessageRequest,
   SocializeAIAPI
@@ -147,7 +148,22 @@ export function installBrowserApiFallback() {
       };
     },
     async listIMessageChats() {
-      return [];
+      return readState()
+        .contacts.filter((contact) => contact.platform === "imessage" && contact.chatId)
+        .map(
+          (contact): IMessageChat => ({
+            chatId: contact.chatId || contact.id,
+            guid: contact.chatGuid || `preview-${contact.id}`,
+            displayName: contact.displayName || contact.handle || "Preview iMessage chat",
+            chatIdentifier: contact.handle || contact.displayName || contact.id,
+            serviceName: "iMessage",
+            participantHandles: contact.handle ? [contact.handle] : [],
+            participantNames: contact.displayName ? [contact.displayName] : [],
+            isGroup: false,
+            lastMessageAt: new Date().toLocaleString(),
+            lastText: "Preview inbound message"
+          })
+        );
     },
     async importIMessageHistory(_request: ImportHistoryRequest) {
       return {

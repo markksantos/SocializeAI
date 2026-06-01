@@ -47,6 +47,22 @@ type PendingBotSend = {
   secondsLeft: number;
 };
 
+type BotWait = {
+  contact: Contact;
+  secondsLeft: number;
+  forceReply: boolean;
+  inboundText?: string;
+};
+
+type HeldBotReview = {
+  contact: Contact;
+  inboundHash: string;
+  text: string;
+  textParts: string[];
+  draft?: DraftResult;
+  reason: string;
+};
+
 const blankContact = (): Contact => ({
   id: crypto.randomUUID(),
   displayName: "",
@@ -103,6 +119,14 @@ function draftTextForDisplay(settings: AppSettings, draft: DraftResult) {
   return appendDisclosureToText(settings, (draft.messageParts?.length ? draft.messageParts : [draft.draftText]).join("\n\n"));
 }
 
+function splitMessageParts(text: string) {
+  return text
+    .split(/\n{2,}/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .slice(0, 4);
+}
+
 function audit(type: AuditEvent["type"], summary: string, detail?: string): AuditEvent {
   return {
     id: crypto.randomUUID(),
@@ -129,6 +153,9 @@ function App() {
   const [draft, setDraft] = useState<DraftResult | null>(null);
   const [finalText, setFinalText] = useState("");
   const [pendingBotSend, setPendingBotSend] = useState<PendingBotSend | null>(null);
+  const [botWait, setBotWait] = useState<BotWait | null>(null);
+  const [heldBotReview, setHeldBotReview] = useState<HeldBotReview | null>(null);
+  const [heldReviewText, setHeldReviewText] = useState("");
   const [permissionReport, setPermissionReport] = useState<MacPermissionReport | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string>("");
@@ -176,6 +203,9 @@ function App() {
     setDraft(null);
     setFinalText("");
     setPendingBotSend(null);
+    setBotWait(null);
+    setHeldBotReview(null);
+    setHeldReviewText("");
     void loadThreadForContact(activeContact, false);
   }, [activeContact?.chatId]);
 
@@ -192,12 +222,24 @@ function App() {
   }, [pendingBotSend?.secondsLeft, pendingBotSend?.inboundHash]);
 
   useEffect(() => {
+    if (!botWait) return;
+    if (botWait.secondsLeft <= 0) {
+      void prepareBotReplyForContact(botWait.contact, "poll", false, botWait.forceReply, true);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setBotWait((waiting) => (waiting ? { ...waiting, secondsLeft: Math.max(0, waiting.secondsLeft - 1) } : waiting));
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [botWait?.secondsLeft, botWait?.contact.id, botWait?.forceReply]);
+
+  useEffect(() => {
     if (!state || !activeContact?.chatId || !state.settings.hasCompletedOnboarding) return;
     const poll = window.setInterval(() => {
       void refreshActiveThreadAndBot(false);
     }, 5000);
     return () => window.clearInterval(poll);
-  }, [state, activeContact?.chatId, pendingBotSend?.inboundHash]);
+  }, [state, activeContact?.chatId, pendingBotSend?.inboundHash, botWait?.contact.id, heldBotReview?.inboundHash]);
 
   async function refreshIMessageChats(showNotice = true) {
     setBusy("chats");
@@ -316,17 +358,21 @@ function App() {
     );
   }
 
-  async function prepareBotReplyForContact(contact: Contact, mode: "manual" | "poll" = "poll", regenerate = false, forceReply = false) {
+  async function prepareBotReplyForContact(contact: Contact, mode: "manual" | "poll" = "poll", regenerate = false, forceReply = false, skipWait = false) {
     if (botCheckInFlight.current || (pendingBotSend && !regenerate)) return;
     botCheckInFlight.current = true;
     if (mode === "manual") setBusy("bot-check");
     try {
       if (regenerate) setPendingBotSend(null);
-      const result: PreparedAutopilotReply = await window.socializeAI.prepareAutopilotReply({ contact, regenerate, forceReply, userInstruction });
+      if (skipWait) setBotWait(null);
+      const result: PreparedAutopilotReply = await window.socializeAI.prepareAutopilotReply({ contact, regenerate, forceReply, skipWait, userInstruction });
       const saved = await window.socializeAI.getState();
       setState(saved);
 
       if (result.ok && result.status === "ready" && result.contact && result.inboundHash && result.draftText) {
+        setBotWait(null);
+        setHeldBotReview(null);
+        setHeldReviewText("");
         setPendingBotSend({
           contact: result.contact,
           inboundHash: result.inboundHash,
@@ -335,6 +381,35 @@ function App() {
           draft: result.draft,
           secondsLeft: 10
         });
+        setNotice("");
+        setError("");
+        return;
+      }
+
+      if (result.status === "waiting" && result.contact) {
+        setBotWait({
+          contact: result.contact,
+          secondsLeft: result.waitSeconds ?? 30,
+          forceReply,
+          inboundText: result.inboundText
+        });
+        if (mode === "manual") setNotice(result.message);
+        return;
+      }
+
+      if (result.status === "held" && result.contact && result.inboundHash && result.draftText) {
+        const textParts = result.messageParts?.length ? result.messageParts : [result.draftText];
+        setBotWait(null);
+        setPendingBotSend(null);
+        setHeldBotReview({
+          contact: result.contact,
+          inboundHash: result.inboundHash,
+          text: result.draftText,
+          textParts,
+          draft: result.draft,
+          reason: result.details.filter(Boolean).join(" ") || result.message
+        });
+        setHeldReviewText(textParts.join("\n\n"));
         setNotice("");
         setError("");
         return;
@@ -407,13 +482,77 @@ function App() {
 
   async function regeneratePendingBotSend() {
     if (!pendingBotSend) return;
-    await prepareBotReplyForContact(pendingBotSend.contact, "manual", true, true);
+    await prepareBotReplyForContact(pendingBotSend.contact, "manual", true, true, true);
+  }
+
+  async function skipBotWait() {
+    if (!botWait) return;
+    await prepareBotReplyForContact(botWait.contact, "manual", false, true, true);
+  }
+
+  async function approveHeldBotReview() {
+    if (!heldBotReview || pendingSendInFlight.current) return;
+    const textParts = splitMessageParts(heldReviewText);
+    if (textParts.length === 0) {
+      setError("Write a reply before approving.");
+      return;
+    }
+    pendingSendInFlight.current = true;
+    setBusy("bot-send");
+    setError("");
+    try {
+      await syncPendingSettings();
+      const result = await window.socializeAI.sendPreparedAutopilotReply({
+        contact: heldBotReview.contact,
+        inboundHash: heldBotReview.inboundHash,
+        text: textParts.join("\n\n"),
+        textParts
+      });
+      const contactName = heldBotReview.contact.displayName || "this chat";
+      setHeldBotReview(null);
+      setHeldReviewText("");
+      if (result.ok) setNotice(result.dryRun ? `Dry run recorded for ${contactName}.` : `Approved and sent reply to ${contactName}.`);
+      else setError(result.detail || result.message);
+      const saved = await window.socializeAI.getState();
+      setState(saved);
+      setSettingsDraft(saved.settings);
+      await loadThreadForContact(heldBotReview.contact, false, true);
+      void refreshIMessageChats(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      pendingSendInFlight.current = false;
+      setBusy(null);
+    }
+  }
+
+  async function denyHeldBotReview() {
+    if (!heldBotReview) return;
+    setBusy("bot-cancel");
+    setError("");
+    try {
+      const result = await window.socializeAI.cancelPreparedAutopilotReply({
+        contact: heldBotReview.contact,
+        inboundHash: heldBotReview.inboundHash,
+        reason: "User denied the held draft from the review popup."
+      });
+      setHeldBotReview(null);
+      setHeldReviewText("");
+      if (result.ok) setNotice("Held bot reply denied.");
+      else setError(result.message);
+      const saved = await window.socializeAI.getState();
+      setState(saved);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
   }
 
   async function refreshActiveThreadAndBot(showNotice = false) {
     if (!state || !activeContact?.chatId) return;
     await loadThreadForContact(activeContact, showNotice, !showNotice);
-    if (botIsRunningForContact(state, activeContact) && !pendingBotSend) {
+    if (botIsRunningForContact(state, activeContact) && !pendingBotSend && !botWait && !heldBotReview) {
       await prepareBotReplyForContact(activeContact, "poll");
     }
   }
@@ -787,6 +926,10 @@ function App() {
             finalText={finalText}
             setFinalText={setFinalText}
             pendingBotSend={pendingBotSend}
+            botWait={botWait}
+            heldBotReview={heldBotReview}
+            heldReviewText={heldReviewText}
+            setHeldReviewText={setHeldReviewText}
             busy={busy}
             onSend={sendMessage}
             onImport={importHistory}
@@ -802,6 +945,9 @@ function App() {
             onSendPendingNow={sendPendingBotNow}
             onCancelPending={cancelPendingBotSend}
             onRegeneratePending={regeneratePendingBotSend}
+            onSkipWait={skipBotWait}
+            onApproveHeldReview={approveHeldBotReview}
+            onDenyHeldReview={denyHeldBotReview}
           />
         )}
         {view === "contacts" && (
@@ -898,6 +1044,10 @@ function Workbench(props: {
   finalText: string;
   setFinalText: (value: string) => void;
   pendingBotSend: PendingBotSend | null;
+  botWait: BotWait | null;
+  heldBotReview: HeldBotReview | null;
+  heldReviewText: string;
+  setHeldReviewText: (value: string) => void;
   busy: string | null;
   onSend: () => void;
   onImport: () => void;
@@ -913,6 +1063,9 @@ function Workbench(props: {
   onSendPendingNow: () => void;
   onCancelPending: () => void;
   onRegeneratePending: () => void;
+  onSkipWait: () => void;
+  onApproveHeldReview: () => void;
+  onDenyHeldReview: () => void;
 }) {
   const selected = props.selectedContact;
   const selectedChat = props.imessageChats.find((chat) => chat.chatId === props.selectedChatId) ?? props.imessageChats[0];
@@ -1148,6 +1301,20 @@ function Workbench(props: {
           )}
         </div>
 
+        {props.botWait && (
+          <div className="waiting-reply-card">
+            <div>
+              <span className="eyebrow">Waiting before replying</span>
+              <strong>Checking again in {props.botWait.secondsLeft}s</strong>
+              <p className="private-text">The latest message is fresh, so the bot is waiting in case they keep texting.</p>
+            </div>
+            <button className="secondary-button" onClick={props.onSkipWait} disabled={props.busy === "bot-check" || props.busy === "bot-send"}>
+              <ChevronRight size={16} />
+              Skip waiting time
+            </button>
+          </div>
+        )}
+
         {props.pendingBotSend && (
           <div className="pending-send-card">
             <div>
@@ -1175,6 +1342,40 @@ function Workbench(props: {
                 <Send size={16} />
                 Send now
               </button>
+            </div>
+          </div>
+        )}
+
+        {props.heldBotReview && (
+          <div className="held-review-backdrop" role="dialog" aria-modal="true">
+            <div className="held-review-modal">
+              <div className="panel-title-row compact-title">
+                <div>
+                  <span className="eyebrow">Bot held this reply</span>
+                  <h3 className="subheading">Review before sending</h3>
+                </div>
+                {props.heldBotReview.draft && <RiskBadge risk={props.heldBotReview.draft.riskLevel} />}
+              </div>
+              <p className="review-reason">{props.heldBotReview.reason}</p>
+              <label className="field-block">
+                <span>Edit reply</span>
+                <textarea
+                  className="private-field"
+                  value={props.heldReviewText}
+                  onChange={(event) => props.setHeldReviewText(event.target.value)}
+                  rows={6}
+                />
+              </label>
+              <div className="held-review-actions">
+                <button className="secondary-button" onClick={props.onDenyHeldReview} disabled={props.busy === "bot-cancel" || props.busy === "bot-send"}>
+                  <X size={16} />
+                  Deny
+                </button>
+                <button className="primary-button" onClick={props.onApproveHeldReview} disabled={props.busy === "bot-send" || !props.heldReviewText.trim()}>
+                  <Send size={16} />
+                  Approve and send
+                </button>
+              </div>
             </div>
           </div>
         )}

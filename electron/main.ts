@@ -1203,11 +1203,12 @@ function detectUserInputNeed(inbound: string, draft: DraftResult, availableConte
   return Array.from(new Set(reasons.filter(Boolean)));
 }
 
-async function prepareAutopilotReply(request: Contact | { contact: Contact; regenerate?: boolean; forceReply?: boolean; userInstruction?: string }) {
+async function prepareAutopilotReply(request: Contact | { contact: Contact; regenerate?: boolean; forceReply?: boolean; skipWait?: boolean; userInstruction?: string }) {
   const state = await readState();
   const contactRequest = "contact" in request ? request.contact : request;
   const regenerate = "contact" in request ? Boolean(request.regenerate) : false;
   const forceReply = "contact" in request ? Boolean(request.forceReply) : false;
+  const skipWait = "contact" in request ? Boolean(request.skipWait) : false;
   const userSuppliedInstruction = "contact" in request ? String(request.userInstruction || "").trim() : "";
   const contact = findStoredContact(state, contactRequest) || contactRequest;
   const details: string[] = [];
@@ -1227,14 +1228,15 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
     if (!inbound) {
       return { ok: false, status: "idle", message: "No inbound iMessage found.", contact, details };
     }
-    const waitSeconds = !regenerate && !userSuppliedInstruction ? secondsUntilInboundSettles(inbound) : 0;
+    const waitSeconds = !skipWait && !regenerate && !userSuppliedInstruction ? secondsUntilInboundSettles(inbound) : 0;
     if (waitSeconds > 0) {
       return {
         ok: false,
-        status: "idle",
+        status: "waiting",
         message: `Waiting ${waitSeconds}s to see if they keep texting before replying.`,
         contact,
         inboundText: inbound,
+        waitSeconds,
         details: [`Latest inbound message is still fresh. Waiting avoids replying before a double/triple text finishes.`]
       };
     }
@@ -1283,7 +1285,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
     const preparedParts = appendDisclosureToParts(state.settings, draft.messageParts);
     const preparedText = joinMessageParts(preparedParts);
 
-    if (!forceReply && !canAutoSendDraft(state, inbound, draft)) {
+    if ((!forceReply || draft.riskLevel === "high") && !canAutoSendDraft(state, inbound, draft)) {
       contact.lastAutopilotInboundHash = inboundHash;
       contact.lastAutopilotAt = nowIso();
       state.audits = [
@@ -1781,7 +1783,7 @@ ipcMain.handle("imessage:import-history", async (_event, request: { handle: stri
 
 ipcMain.handle("autopilot:run-once", async () => runAutopilotOnce("manual"));
 
-ipcMain.handle("autopilot:prepare-reply", async (_event, request: Contact | { contact: Contact; regenerate?: boolean; forceReply?: boolean; userInstruction?: string }) =>
+ipcMain.handle("autopilot:prepare-reply", async (_event, request: Contact | { contact: Contact; regenerate?: boolean; forceReply?: boolean; skipWait?: boolean; userInstruction?: string }) =>
   prepareAutopilotReply(request)
 );
 

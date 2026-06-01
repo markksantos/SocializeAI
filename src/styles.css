@@ -956,7 +956,8 @@ select:focus {
     #fffdf7;
 }
 
-.pending-send-card {
+.pending-send-card,
+.waiting-reply-card {
   display: grid;
   grid-template-columns: minmax(0, 1fr) max-content;
   gap: 14px;
@@ -968,22 +969,66 @@ select:focus {
   background: #fff4df;
 }
 
+.waiting-reply-card {
+  border-color: #b9c9d9;
+  background: #f1f7fb;
+}
+
 .pending-send-card strong,
-.pending-send-card p {
+.pending-send-card p,
+.waiting-reply-card strong,
+.waiting-reply-card p {
   display: block;
   margin: 0;
 }
 
-.pending-send-card strong {
+.pending-send-card strong,
+.waiting-reply-card strong {
   margin-top: 5px;
   font-size: 1rem;
 }
 
-.pending-send-card p {
+.pending-send-card p,
+.waiting-reply-card p {
   margin-top: 6px;
   color: var(--ink);
   line-height: 1.38;
   white-space: pre-wrap;
+}
+
+.held-review-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(39, 34, 28, 0.42);
+}
+
+.held-review-modal {
+  width: min(620px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  overflow: auto;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fffdf7;
+  box-shadow: 0 24px 80px rgba(51, 42, 30, 0.28);
+}
+
+.review-reason {
+  margin: 8px 0 12px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.held-review-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
 }
 
 .pending-actions {

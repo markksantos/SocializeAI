@@ -172,11 +172,12 @@ export type AutopilotRunResult = {
 
 export type PreparedAutopilotReply = {
   ok: boolean;
-  status: "ready" | "idle" | "held" | "blocked" | "needs_input";
+  status: "ready" | "idle" | "waiting" | "held" | "blocked" | "needs_input";
   message: string;
   contact?: Contact;
   inboundHash?: string;
   inboundText?: string;
+  waitSeconds?: number;
   draftText?: string;
   messageParts?: string[];
   draft?: DraftResult;
@@ -187,6 +188,7 @@ export type PrepareAutopilotReplyRequest = {
   contact: Contact;
   regenerate?: boolean;
   forceReply?: boolean;
+  skipWait?: boolean;
   userInstruction?: string;
 };
 
