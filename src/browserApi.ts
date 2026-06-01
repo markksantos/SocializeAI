@@ -66,6 +66,13 @@ function appendAudit(state: AppState, type: AppState["audits"][number]["type"], 
   };
 }
 
+function appendDisclosureToText(settings: AppSettings, rawText: string) {
+  const text = rawText.trim();
+  const disclosure = settings.appendDisclosure ? settings.disclosureText.trim() : "";
+  if (!disclosure || text.endsWith(disclosure)) return text;
+  return `${text}\n\n${disclosure}`;
+}
+
 function previewDraft(request: DraftRequest, settings: AppSettings): DraftResult {
   const text = request.currentMessage.trim();
   const lower = `${text} ${request.conversationContext}`.toLowerCase();
@@ -129,7 +136,8 @@ export function installBrowserApiFallback() {
       };
     },
     async sendMessage(request: SendMessageRequest) {
-      const state = appendAudit(readState(), "message_dry_run", `Preview dry run for ${request.contact.displayName}`, request.text);
+      const current = readState();
+      const state = appendAudit(current, "message_dry_run", `Preview dry run for ${request.contact.displayName}`, appendDisclosureToText(current.settings, request.text));
       writeState(state);
       return {
         ok: true,
@@ -183,13 +191,14 @@ export function installBrowserApiFallback() {
         contact,
         inboundHash: crypto.randomUUID(),
         inboundText: "Preview inbound message",
-        draftText: draft.draftText,
+        draftText: appendDisclosureToText(state.settings, draft.draftText),
         draft,
         details: []
       };
     },
     async sendPreparedAutopilotReply(request) {
-      const state = appendAudit(readState(), "message_dry_run", `Preview bot dry run for ${request.contact.displayName}`, request.text);
+      const current = readState();
+      const state = appendAudit(current, "message_dry_run", `Preview bot dry run for ${request.contact.displayName}`, appendDisclosureToText(current.settings, request.text));
       writeState(state);
       return {
         ok: true,

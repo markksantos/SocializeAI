@@ -1032,14 +1032,25 @@ function latestInboundLine(messages: string, handle: string) {
   });
 }
 
-async function dispatchApprovedMessage(state: AppState, contact: Contact, rawText: string) {
-  let text = rawText.trim();
+function appendDisclosureToText(settings: AppSettings, rawText: string) {
+  const text = rawText.trim();
   if (!text) throw new Error("Message is empty.");
-  if (state.settings.appendDisclosure && state.settings.disclosureText.trim()) {
-    text = `${text}\n\n${state.settings.disclosureText.trim()}`;
-  }
+  const disclosure = settings.appendDisclosure ? settings.disclosureText.trim() : "";
+  if (!disclosure || text.endsWith(disclosure)) return text;
+  return `${text}\n\n${disclosure}`;
+}
 
-  const dryRun = contact.platform === "whatsapp" ? state.settings.whatsappDryRun : contact.platform === "imessage" ? state.settings.iMessageDryRun : true;
+async function dispatchApprovedMessage(state: AppState, contact: Contact, rawText: string, dryRunOverride?: boolean) {
+  const text = appendDisclosureToText(state.settings, rawText);
+
+  const dryRun =
+    typeof dryRunOverride === "boolean"
+      ? dryRunOverride
+      : contact.platform === "whatsapp"
+        ? state.settings.whatsappDryRun
+        : contact.platform === "imessage"
+          ? state.settings.iMessageDryRun
+          : true;
   if (dryRun || contact.platform === "manual") {
     return {
       ok: true,
@@ -1056,7 +1067,7 @@ async function dispatchApprovedMessage(state: AppState, contact: Contact, rawTex
       ok: true,
       dryRun: false,
       message: "iMessage send command completed.",
-      detail
+      detail: detail || text
     };
   }
 
@@ -1066,7 +1077,8 @@ async function dispatchApprovedMessage(state: AppState, contact: Contact, rawTex
       ok: true,
       dryRun: false,
       message: "WhatsApp Cloud API accepted the message.",
-      receiptId
+      receiptId,
+      detail: text
     };
   }
 
@@ -1137,6 +1149,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
         ? "Autopilot mode. Regenerate a different concise, natural reply in the user's voice. Avoid repeating the previous wording. Only set can_auto_send true and requires_human_review false for simple low-risk acknowledgements, casual replies, or scheduling."
         : "Autopilot mode. Produce a concise, natural reply in the user's voice. Only set can_auto_send true and requires_human_review false for simple low-risk acknowledgements, casual replies, or scheduling."
     });
+    const preparedText = appendDisclosureToText(state.settings, draft.draftText);
 
     if (!canAutoSendDraft(state, inbound, draft)) {
       contact.lastAutopilotInboundHash = inboundHash;
@@ -1153,7 +1166,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
         contact,
         inboundHash,
         inboundText: inbound,
-        draftText: draft.draftText,
+        draftText: preparedText,
         draft,
         details: [draft.sendEligibility.explanation]
       };
@@ -1171,7 +1184,7 @@ async function prepareAutopilotReply(request: Contact | { contact: Contact; rege
       contact,
       inboundHash,
       inboundText: inbound,
-      draftText: draft.draftText,
+      draftText: preparedText,
       draft,
       details
     };
@@ -1545,11 +1558,8 @@ ipcMain.handle("draft:generate", async (_event, request: unknown) => {
 ipcMain.handle("message:send", async (_event, request: { contact: Contact; text: string; dryRunOverride?: boolean }) => {
   const state = await readState();
   const contact = request.contact;
-  let text = request.text.trim();
-  if (!contact || !text) throw new Error("Choose a contact and write a message first.");
-  if (state.settings.appendDisclosure && state.settings.disclosureText.trim()) {
-    text = `${text}\n\n${state.settings.disclosureText.trim()}`;
-  }
+  if (!contact) throw new Error("Choose a contact and write a message first.");
+  const text = appendDisclosureToText(state.settings, request.text);
   if (contact.optedOut) {
     state.audits = [createAudit("message_blocked", `Blocked send to ${contact.displayName}`, "Contact is opted out."), ...state.audits].slice(0, 500);
     await writeState(state);
@@ -1562,39 +1572,18 @@ ipcMain.handle("message:send", async (_event, request: { contact: Contact; text:
     return { ok: false, dryRun: false, message: "Blocked: sensitive or emergency content needs direct human handling.", detail: sensitive.join(", ") };
   }
 
-  const dryRun =
-    typeof request.dryRunOverride === "boolean"
-      ? request.dryRunOverride
-      : contact.platform === "whatsapp"
-        ? state.settings.whatsappDryRun
-        : contact.platform === "imessage"
-          ? state.settings.iMessageDryRun
-          : true;
-
-  if (dryRun || contact.platform === "manual") {
+  try {
+    const result = await dispatchApprovedMessage(state, contact, text, request.dryRunOverride);
     state.audits = [
-      createAudit("message_dry_run", `Dry run for ${contact.displayName}`, `${contact.platform}: ${text}`),
+      createAudit(
+        result.dryRun ? "message_dry_run" : "message_sent",
+        result.dryRun ? `Dry run for ${contact.displayName}` : `Sent ${contact.platform === "whatsapp" ? "WhatsApp message" : "iMessage"} to ${contact.displayName}`,
+        result.detail || text
+      ),
       ...state.audits
     ].slice(0, 500);
     await writeState(state);
-    return { ok: true, dryRun: true, message: "Dry run recorded. No message was sent." };
-  }
-
-  try {
-    if (contact.platform === "imessage") {
-      if (!contact.handle.trim()) throw new Error("This iMessage contact needs a phone number or Apple ID handle.");
-      const detail = await sendIMessage(contact.handle, text, contact.chatGuid);
-      state.audits = [createAudit("message_sent", `Sent iMessage to ${contact.displayName}`, detail || text), ...state.audits].slice(0, 500);
-      await writeState(state);
-      return { ok: true, dryRun: false, message: "iMessage send command completed.", detail };
-    }
-    if (contact.platform === "whatsapp") {
-      const receiptId = await sendWhatsApp(state.settings, contact.handle, text);
-      state.audits = [createAudit("message_sent", `Sent WhatsApp message to ${contact.displayName}`, receiptId || text), ...state.audits].slice(0, 500);
-      await writeState(state);
-      return { ok: true, dryRun: false, message: "WhatsApp Cloud API accepted the message.", receiptId };
-    }
-    throw new Error("Unsupported platform.");
+    return result;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Send failed.";
     state.audits = [createAudit("message_blocked", `Send failed for ${contact.displayName}`, message), ...state.audits].slice(0, 500);

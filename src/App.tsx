@@ -141,6 +141,13 @@ function botIsRunningForContact(state: AppState, contact?: Contact) {
   return Boolean(managed?.allowAutopilot && !managed.optedOut && !state.settings.iMessageDryRun && !state.settings.requireHumanApproval);
 }
 
+function appendDisclosureToText(settings: AppSettings, rawText: string) {
+  const text = rawText.trim();
+  const disclosure = settings.appendDisclosure ? settings.disclosureText.trim() : "";
+  if (!disclosure || text.endsWith(disclosure)) return text;
+  return `${text}\n\n${disclosure}`;
+}
+
 function audit(type: AuditEvent["type"], summary: string, detail?: string): AuditEvent {
   return {
     id: crypto.randomUUID(),
@@ -259,6 +266,18 @@ function App() {
     return saved;
   }
 
+  async function syncPendingSettings() {
+    if (!state) return null;
+    if (JSON.stringify(state.settings) === JSON.stringify(settingsDraft)) return state;
+    const saved = await window.socializeAI.saveState({
+      ...state,
+      settings: settingsDraft
+    });
+    setState(saved);
+    setSettingsDraft(saved.settings);
+    return saved;
+  }
+
   async function saveSettings() {
     if (!state) return;
     setBusy("settings");
@@ -306,14 +325,14 @@ function App() {
     if (!state || !activeContact) return;
     if (activeContact.platform === "imessage") {
       await saveOperationalSettings(
-        { ...state.settings, iMessageDryRun: !enabled },
+        { ...settingsDraft, iMessageDryRun: !enabled },
         enabled ? "Enabled live iMessage sending" : "Enabled iMessage dry run",
         activeContact.displayName || activeContact.handle,
         enabled ? "Live iMessage sending is on. Pressing Send real iMessage will use Messages.app." : "iMessage dry run is on. Sends will only be recorded."
       );
     } else if (activeContact.platform === "whatsapp") {
       await saveOperationalSettings(
-        { ...state.settings, whatsappDryRun: !enabled },
+        { ...settingsDraft, whatsappDryRun: !enabled },
         enabled ? "Enabled live WhatsApp sending" : "Enabled WhatsApp dry run",
         activeContact.displayName || activeContact.handle,
         enabled ? "Live WhatsApp sending is on for configured Business Cloud API sends." : "WhatsApp dry run is on. Sends will only be recorded."
@@ -324,7 +343,7 @@ function App() {
   async function setAutopilotSchedule(enabled: boolean) {
     if (!state) return;
     await saveOperationalSettings(
-      { ...state.settings, autopilotEnabled: enabled },
+      { ...settingsDraft, autopilotEnabled: enabled },
       enabled ? "Enabled scheduled autopilot" : "Paused scheduled autopilot",
       "Workbench autopilot control",
       enabled ? "Scheduled autopilot is on for saved chats." : "Scheduled autopilot is paused."
@@ -334,7 +353,7 @@ function App() {
   async function setHumanApprovalRequired(required: boolean) {
     if (!state) return;
     await saveOperationalSettings(
-      { ...state.settings, requireHumanApproval: required },
+      { ...settingsDraft, requireHumanApproval: required },
       required ? "Require human approval enabled" : "Autopilot auto-send gate enabled",
       "Workbench autopilot control",
       required ? "Autopilot will hold drafts for review." : "Autopilot can auto-send only low-risk eligible drafts when live send is also on."
@@ -385,6 +404,7 @@ function App() {
     setBusy("bot-send");
     setError("");
     try {
+      await syncPendingSettings();
       const result = await window.socializeAI.sendPreparedAutopilotReply({
         contact: pendingBotSend.contact,
         inboundHash: pendingBotSend.inboundHash,
@@ -482,7 +502,7 @@ function App() {
         {
           ...state,
           settings: {
-            ...state.settings,
+            ...settingsDraft,
             iMessageDryRun: false,
             requireHumanApproval: false,
             autopilotEnabled: false
@@ -531,8 +551,8 @@ function App() {
         {
           ...state,
           settings: {
-            ...state.settings,
-            autopilotEnabled: anyChatStillRunning && state.settings.autopilotEnabled
+            ...settingsDraft,
+            autopilotEnabled: anyChatStillRunning && settingsDraft.autopilotEnabled
           },
           contacts,
           audits: [
@@ -589,6 +609,7 @@ function App() {
     setError("");
     setNotice("");
     try {
+      await syncPendingSettings();
       let context = conversationContext;
       let latest = currentMessage;
       if (activeContact.platform === "imessage" && activeContact.chatId) {
@@ -604,7 +625,7 @@ function App() {
         userInstruction
       });
       setDraft(result);
-      setFinalText(result.draftText);
+      setFinalText(appendDisclosureToText(settingsDraft, result.draftText));
       setNotice("Draft generated.");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -619,6 +640,7 @@ function App() {
     setError("");
     setNotice("");
     try {
+      await syncPendingSettings();
       const result: SendMessageResult = await window.socializeAI.sendMessage({
         contact: activeContact,
         text: finalText
