@@ -33,3 +33,6 @@ pnpm-debug.log*
 
 # internal agent work notes
 tasks/
+
+# Xcode derived data (alt naming)
+DerivedDataCap/
